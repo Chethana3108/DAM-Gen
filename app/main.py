@@ -243,20 +243,29 @@ def generate_from_prompt(req: PromptOnlyRequest):
         logo_path=logo_path
     )
 
-    # Step 4: Dynamically Synthesize Creative Scene Prompts via UniversalLayerMixer
-    pos_prompt, neg_prompt = UniversalLayerMixer.compose_dynamic_prompts(
-        asset_context=asset_ctx,
-        user_prompt=req.prompt
+    # Step 4: Dynamically Synthesize Creative Scene Environment Prompts
+    scene_pos_prompt, scene_neg_prompt = UniversalLayerMixer.build_scene_generation_prompt(
+        user_prompt=req.prompt,
+        asset_context=asset_ctx
     )
 
-    # Step 5: Execute Multi-Modal Scene Synthesis (GPU Diffusion - Zero 2D Cutouts)
-    logger.info("Step 5: Synthesizing realistic scene with %d reference layer(s)...", len(reference_paths))
-    final_image = diffusion_engine.generate(
-        positive_prompt=pos_prompt,
-        negative_prompt=neg_prompt,
+    # Step 5: Synthesize AI Scene Environment (e.g. cafe table with coffee cup and morning sunlight)
+    logger.info("Step 5: Synthesizing photorealistic scene environment...")
+    ai_scene = diffusion_engine.generate(
+        positive_prompt=scene_pos_prompt,
+        negative_prompt=scene_neg_prompt,
         reference_image_paths=reference_paths,
         width=width,
         height=height
+    )
+
+    # Step 6: Seamlessly Integrate Authentic DAM Asset with Studio Relighting & Contact Shadows
+    # Retains 100% of the authentic product, genuine typography, and real textures
+    logger.info("Step 6: Integrating authentic DAM product asset into AI scene with optical grounding...")
+    final_image = UniversalLayerMixer.blend_authentic_asset_into_scene(
+        ai_scene=ai_scene,
+        asset_context=asset_ctx,
+        user_prompt=req.prompt
     )
 
     # Convert to JPEG & Base64
@@ -290,12 +299,12 @@ def generate_from_prompt(req: PromptOnlyRequest):
         model=f"{IMAGE_MODEL} ({diffusion_engine.model_type})",
         brand=brand_name,
         product=product_name,
-        prompt_used=pos_prompt,
+        prompt_used=scene_pos_prompt,
         mime_type='image/jpeg',
         image_base64=image_b64,
         sitecore_asset_id=sitecore_asset_id,
         sitecore_create_url=create_tab_url,
-        note='Visual synthesized organically by open-source diffusion grounded in DAM references (zero 2D cutout overlays) and stored in Create tab.'
+        note='Authentic DAM asset preserved with 100% pixel fidelity; AI-generated scene, lighting, and contact shadows.'
     )
 
 @app.post('/api/chat')
