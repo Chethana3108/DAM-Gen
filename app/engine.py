@@ -105,27 +105,42 @@ class OpenSourceDiffusionEngine:
         else:
             generator.seed()
 
-        # Target: FLUX.1-schnell (World's #1 model for text and commercial realism)
-        if self.model_type == "flux":
-            if _LOADED_PIPELINE is None or _LOADED_MODEL_TYPE != "flux":
-                from diffusers import FluxPipeline
-                logger.info("Loading FLUX.1-schnell pipeline into GPU VRAM (bfloat16)...")
-                _LOADED_PIPELINE = FluxPipeline.from_pretrained(
-                    "black-forest-labs/FLUX.1-schnell",
-                    torch_dtype=torch.bfloat16
-                ).to("cuda")
-                _LOADED_MODEL_TYPE = "flux"
-                logger.info("FLUX.1-schnell successfully loaded!")
+        # Target: FLUX.2 / FLUX.1 (World's #1 model for text, brand fidelity, and commercial realism)
+        if "flux" in self.model_type:
+            if _LOADED_PIPELINE is None or _LOADED_MODEL_TYPE != self.model_type:
+                logger.info(f"Loading FLUX.2 pipeline ({self.model_type}) into GPU VRAM (bfloat16)...")
+                try:
+                    from diffusers import Flux2Pipeline
+                    _LOADED_PIPELINE = Flux2Pipeline.from_pretrained(
+                        "black-forest-labs/FLUX.2-dev",
+                        torch_dtype=torch.bfloat16
+                    ).to("cuda")
+                    logger.info("FLUX.2-dev successfully loaded into GPU VRAM!")
+                except Exception as e_flux2:
+                    logger.info(f"Flux2Pipeline load exception ({e_flux2}); using FluxPipeline...")
+                    from diffusers import FluxPipeline
+                    model_repo = "black-forest-labs/FLUX.2-dev" if "2" in self.model_type else "black-forest-labs/FLUX.1-schnell"
+                    _LOADED_PIPELINE = FluxPipeline.from_pretrained(
+                        model_repo,
+                        torch_dtype=torch.bfloat16
+                    ).to("cuda")
+                    logger.info(f"{model_repo} successfully loaded!")
+                _LOADED_MODEL_TYPE = self.model_type
 
-            logger.info("Synthesizing visual with FLUX.1-schnell (4 inference steps)...")
-            result = _LOADED_PIPELINE(
-                prompt=positive_prompt,
-                width=width,
-                height=height,
-                num_inference_steps=4,
-                max_sequence_length=256,
-                generator=generator
-            ).images[0]
+            logger.info("Synthesizing visual with FLUX.2 (Rectified Flow Transformer)...")
+            pipe_kwargs = {
+                "prompt": positive_prompt,
+                "width": width,
+                "height": height,
+                "num_inference_steps": 24 if "dev" in self.model_type or "2" in self.model_type else 4,
+                "generator": generator
+            }
+            # Multi-reference input support if available
+            valid_refs = [Image.open(p).convert("RGB") for p in reference_image_paths if os.path.exists(p)]
+            if valid_refs and hasattr(_LOADED_PIPELINE, "image"):
+                pipe_kwargs["image"] = valid_refs[0]
+
+            result = _LOADED_PIPELINE(**pipe_kwargs).images[0]
             return result
 
         # Target: SDXL with IP-Adapter (Direct reference image conditioning)
@@ -173,30 +188,71 @@ class OpenSourceDiffusionEngine:
         """
         from gradio_client import Client as GradioClient, handle_file
         
-        endpoint = os.getenv("MODEL_ENDPOINT", "black-forest-labs/FLUX.1-schnell")
+        endpoint = os.getenv("MODEL_ENDPOINT", "black-forest-labs/FLUX.2-dev")
         hf_token = os.getenv("HF_TOKEN", None) or None
         logger.info(f"Using remote diffusion endpoint: {endpoint}")
 
-        # Attempt 1: FLUX.1 endpoint
-        try:
-            client = GradioClient(endpoint, token=hf_token)
-            # Standard FLUX Gradio space call signature
-            res_path = client.predict(
-                prompt=positive_prompt,
-                seed=0,
-                randomize_seed=True,
-                width=width,
-                height=height,
-                num_inference_steps=4,
-                api_name="/infer"
-            )
-            # Gradio may return tuple (path, seed) or path
-            if isinstance(res_path, (list, tuple)):
-                res_path = res_path[0]
-            if os.path.exists(res_path):
-                return Image.open(res_path)
-        except Exception as e:
-            logger.warning(f"Primary endpoint {endpoint} failed: {e}. Trying high-speed SDXL...")
+        # Attempt 1: FLUX.2 / FLUX.1 endpoint
+        endpoints_to_try = [
+            endpoint,
+            "black-forest-labs/FLUX.2-dev",
+            "multimodalart/FLUX.2-dev-turbo",
+            "black-forest-labs/FLUX.1-schnell"
+        ]
+        # Remove duplicates while preserving order
+        seen = set()
+        endpoints_to_try = [x for x in endpoints_to_try if not (x in seen or seen.add(x))]
+
+        for ep in endpoints_to_try:
+            try:
+                logger.info(f"Connecting to diffusion space: {ep}...")
+                client = GradioClient(ep, token=hf_token)
+                
+                # Check for FLUX.2-dev multi-reference signature
+                res_path = None
+                try:
+                    # Input images gallery for multi-reference conditioning
+                    img_list = []
+                    for p in reference_image_paths:
+                        if os.path.exists(p):
+                            img_list.append({"image": handle_file(p), "caption": "DAM Product Reference"})
+
+                    res_path = client.predict(
+                        prompt=positive_prompt,
+                        input_images=img_list,
+                        seed=0,
+                        randomize_seed=True,
+                        width=width,
+                        height=height,
+                        num_inference_steps=24,
+                        guidance_scale=4.0,
+                        prompt_upsampling=False,
+                        api_name="/infer"
+                    )
+                except Exception as e_flux2_sig:
+                    # Standard FLUX.1 schnell / turbo signature
+                    res_path = client.predict(
+                        prompt=positive_prompt,
+                        seed=0,
+                        randomize_seed=True,
+                        width=width,
+                        height=height,
+                        num_inference_steps=4,
+                        api_name="/infer"
+                    )
+
+                img_file = res_path
+                if isinstance(res_path, (list, tuple)):
+                    img_file = res_path[0]
+                if isinstance(img_file, dict):
+                    img_file = img_file.get("path")
+
+                if img_file and os.path.exists(img_file):
+                    logger.info(f"Successfully synthesized visual via {ep}!")
+                    return Image.open(img_file)
+
+            except Exception as e:
+                logger.warning(f"Endpoint {ep} failed: {e}. Trying next available model...")
 
         # Attempt 2: High-speed SDXL endpoint with zero pasting
         try:

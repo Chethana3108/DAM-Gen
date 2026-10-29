@@ -24,8 +24,8 @@ logging.basicConfig(level=os.getenv('LOG_LEVEL', 'INFO'))
 logger = logging.getLogger('brand-image-api')
 
 HF_TOKEN = os.getenv('HF_TOKEN', '')
-IMAGE_MODEL = os.getenv('IMAGE_MODEL', 'FLUX.1-schnell (Open Source)')
-MODEL_ENDPOINT = os.getenv('MODEL_ENDPOINT', 'black-forest-labs/FLUX.1-schnell')
+IMAGE_MODEL = os.getenv('IMAGE_MODEL', 'FLUX.2-dev (Black Forest Labs 32B Multi-Reference)')
+MODEL_ENDPOINT = os.getenv('MODEL_ENDPOINT', 'black-forest-labs/FLUX.2-dev')
 
 # Initialize Sitecore DAM Client & Open-Source Diffusion Engine
 dam_client = SitecoreDAMClient()
@@ -243,11 +243,11 @@ def generate_from_prompt(req: PromptOnlyRequest):
     analyzed_asset = AssetAnalyzer.analyze(primary_path, metadata=brand_context)
 
     # Step 5: Commercial Image Generation Pipeline
-    # Check model architecture: FLUX.1 / FLUX.2 vs SDXL / Hybrid
-    use_flux = (diffusion_engine.model_type == "flux")
+    # Check model architecture: FLUX.2 / FLUX.1 vs SDXL / Hybrid
+    use_flux = ("flux" in diffusion_engine.model_type)
 
     if use_flux:
-        # FLUX.1 / FLUX.2 Organic Commercial Master Generation
+        # FLUX.2 / FLUX.1 Organic Commercial Master Generation
         # FLUX uses dual text encoders (Google T5-XXL 11B + CLIP) to synthesize the product packaging,
         # authentic typography, and requested physical environment organically in one cohesive 3D pass.
         # Zero 2D flat collage pasting, zero border cuts over scene objects.
@@ -330,7 +330,7 @@ def generate_from_prompt(req: PromptOnlyRequest):
         sitecore_create_url=create_tab_url,
         quality_report=quality_report,
         disambiguation_required=False,
-        note='Synthesized natively with FLUX 12B Flow Transformer using authentic DAM metadata and un-altered brand typography.' if use_flux else 'Original DAM product asset 100% preserved; AI-generated scene, lighting, and contact shadows.'
+        note='Synthesized natively with FLUX.2 (32B Multi-Reference Flow Transformer) using authentic DAM metadata and un-altered brand typography.' if use_flux else 'Original DAM product asset 100% preserved; AI-generated scene, lighting, and contact shadows.'
     )
 
 @app.post('/api/chat')

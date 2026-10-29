@@ -1,14 +1,15 @@
-# Sitecore DAM GenAI Brand Campaign Assistant (Vast.ai GPU Edition)
+# Sitecore DAM GenAI Brand Campaign Assistant (FLUX.2 Edition)
 
-A professional, prompt-only GenAI campaign visual generator powered by open-source diffusion models (**FLUX.1-schnell** / **SDXL with IP-Adapter**) and integrated directly with **Sitecore Content Hub DAM**.
+A professional, prompt-only GenAI campaign visual generator powered by open-source diffusion models (**FLUX.2-dev** / **FLUX.2-klein** / **FLUX.1**) and integrated directly with **Sitecore Content Hub DAM**.
 
 ---
 
 ## 🌟 Key Capabilities
 
-1. **Native Open-Source Diffusion (No 2D Sticker Pasting)**:
-   - The engine automatically retrieves authentic product packshots and official logos from Sitecore DAM.
-   - Using **FLUX.1-schnell** (12B parameter flow matching transformer) or **SDXL with IP-Adapter**, the AI synthesizes the entire scene **organically in 3D**, rendering accurate brand typography, exact biscuit textures, and authentic packaging with zero fake gibberish labels.
+1. **Native FLUX.2 Multi-Reference Flow Transformer (No 2D Sticker Pasting)**:
+   - The engine automatically retrieves authentic product packshots, linked layers, and official logos from Sitecore DAM.
+   - Using **FLUX.2-dev** (32B parameter multi-reference rectified flow transformer) powered by Google's 11B **T5-XXL** text reasoning encoder, the AI synthesizes the entire scene **organically in 3D**.
+   - Renders accurate brand typography, exact packaging details, and genuine textures with zero fake gibberish labels.
    - Completely eliminates fake jars, mismatched containers, and artificial 2D cutout layers.
 
 2. **Dynamic Color & Style Intelligence**:
@@ -42,8 +43,10 @@ cd DAM-Gen
 ### 3. Configure `.env`
 Create `.env` or edit the existing file:
 ```env
-# Open-Source Diffusion Model on GPU: 'flux' (FLUX.1-schnell) or 'ip-adapter' (SDXL IP-Adapter)
-DIFFUSION_MODEL_TYPE=flux
+# Open-Source Diffusion Model: 'flux.2' (FLUX.2-dev), 'flux' (FLUX.1-schnell), or 'ip-adapter'
+DIFFUSION_MODEL_TYPE=flux.2
+IMAGE_MODEL=FLUX.2-dev (Black Forest Labs 32B Multi-Reference)
+MODEL_ENDPOINT=black-forest-labs/FLUX.2-dev
 
 # Sitecore Content Hub DAM Settings
 SITECORE_CH_URL=https://btr-q-002.sitecorecontenthub.cloud
