@@ -10,9 +10,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 from PIL import Image
-from gradio_client import Client as GradioClient, handle_file
 
 from app.sitecore_dam import SitecoreDAMClient
+from app.engine import OpenSourceDiffusionEngine, build_organic_master_prompt
 
 load_dotenv()
 
@@ -20,12 +20,12 @@ logging.basicConfig(level=os.getenv('LOG_LEVEL', 'INFO'))
 logger = logging.getLogger('brand-image-api')
 
 HF_TOKEN = os.getenv('HF_TOKEN', '')
-IMAGE_MODEL = os.getenv('IMAGE_MODEL', 'Qwen/Qwen-Image-2.1')
-# For Vast.ai or local GPU deployments, set MODEL_ENDPOINT to your local URL (e.g. http://127.0.0.1:7860) or HF Space ID
-MODEL_ENDPOINT = os.getenv('MODEL_ENDPOINT', os.getenv('QWEN_SPACE_ID', 'Qwen/Qwen-Image-2.1'))
+IMAGE_MODEL = os.getenv('IMAGE_MODEL', 'FLUX.1-schnell (Open Source)')
+MODEL_ENDPOINT = os.getenv('MODEL_ENDPOINT', 'black-forest-labs/FLUX.1-schnell')
 
-# Initialize Sitecore DAM Client
+# Initialize Sitecore DAM Client & Open-Source Diffusion Engine
 dam_client = SitecoreDAMClient()
+diffusion_engine = OpenSourceDiffusionEngine()
 
 # Aspect ratio map for high-fidelity commercial resolution
 ASPECT_RATIO_MAP = {
@@ -160,96 +160,6 @@ class UnifiedGenerationResponse(BaseModel):
     note: str
 
 # -------------------------------------------------------------
-# Multimodal Reference Generation Pipeline
-# -------------------------------------------------------------
-
-def run_multimodal_reference_generation(
-    prompt: str,
-    reference_image_paths: List[str],
-    width: int,
-    height: int
-) -> Image.Image:
-    """
-    Executes multimodal conditioning with visual reference images.
-    Connects to the Vast.ai GPU server or HF Space endpoint.
-    """
-    logger.info("Connecting to model endpoint at %s...", MODEL_ENDPOINT)
-    try:
-        # Use HF token if connecting to Hugging Face, or none if connecting to local Vast.ai server
-        token = HF_TOKEN if ('huggingface.co' in MODEL_ENDPOINT or '/' in MODEL_ENDPOINT and not MODEL_ENDPOINT.startswith('http')) else None
-        client = GradioClient(MODEL_ENDPOINT, token=token)
-
-        # Prepare reference input images for Gradio
-        input_images_payload = []
-        for p in reference_image_paths:
-            if os.path.exists(p):
-                input_images_payload.append({"image": handle_file(p)})
-                logger.info("Attached reference asset: %s", p)
-
-        # Step 1: /prepare_request with multimodal reference images
-        logger.info("Executing /prepare_request with %d reference image(s)...", len(input_images_payload))
-        prep_result = client.predict(
-            input_images=input_images_payload,
-            original_prompt=prompt,
-            enable_extend=True,
-            custom_size=True,
-            quality='speed',
-            seed=0,
-            randomize_seed=True,
-            api_name='/prepare_request',
-        )
-        seed = prep_result[1]
-        enhanced_prompt = prep_result[2] if len(prep_result) > 2 and prep_result[2] else prompt
-
-        # Step 2: /generate_request
-        logger.info("Executing /generate_request with seed=%s, size=%dx%d...", seed, width, height)
-        image_path = client.predict(
-            original_prompt=enhanced_prompt,
-            enable_extend=True,
-            custom_size=True,
-            log_dir='./generation_logs',
-            seed=seed,
-            height=float(height),
-            width=float(width),
-            negative_prompt=DEFAULT_NEGATIVE_PROMPT,
-            api_name='/generate_request',
-        )
-
-        if not image_path or not os.path.exists(image_path):
-            raise HTTPException(status_code=502, detail="Model endpoint returned no image file.")
-
-        return Image.open(image_path)
-
-    except Exception as e:
-        logger.warning(f"Multimodal generation endpoint failed or quota exceeded: {e}")
-        # If running on local dev without GPU, generate via high-speed SDXL with harmonization
-        return fallback_generation(prompt, reference_image_paths, width, height)
-
-def fallback_generation(
-    prompt: str,
-    reference_image_paths: List[str],
-    width: int,
-    height: int
-) -> Image.Image:
-    """Local / dev fallback when GPU server is not yet deployed."""
-    from app.composer import compose_commercial_scene
-    logger.info("Using high-speed fallback generation...")
-    sdxl_client = GradioClient('AP123/SDXL-Lightning')
-    img_path = sdxl_client.predict(prompt, '4-Step', api_name='/generate_image')
-    scene = Image.open(img_path)
-
-    prod_bytes = None
-    logo_bytes = None
-    if reference_image_paths:
-        with open(reference_image_paths[0], 'rb') as f:
-            prod_bytes = f.read()
-        if len(reference_image_paths) > 1:
-            with open(reference_image_paths[1], 'rb') as f:
-                logo_bytes = f.read()
-
-    return compose_commercial_scene(scene, prod_bytes, logo_bytes)
-
-# -------------------------------------------------------------
 # Endpoints
 # -------------------------------------------------------------
 
@@ -257,8 +167,10 @@ def fallback_generation(
 def health():
     return {
         'status': 'ok',
+        'engine': 'OpenSourceDiffusionEngine',
+        'has_cuda': diffusion_engine.has_cuda,
+        'model_type': diffusion_engine.model_type,
         'model_endpoint': MODEL_ENDPOINT,
-        'image_model': IMAGE_MODEL,
         'sitecore_ch_url': dam_client.ch_url,
     }
 
@@ -268,8 +180,9 @@ def generate_from_prompt(req: PromptOnlyRequest):
     Prompt-Only API:
     1. Automatically resolves Brand & Product reference assets from Sitecore Content Hub DAM.
     2. Downloads approved assets to local reference storage.
-    3. Runs multimodal reference conditioning so the AI natively generates the scene from reference.
-    4. Automatically ingests the final visual directly into Sitecore DAM Create Tab (/en-us/create?p840=1).
+    3. Builds physically-grounded organic prompt to eliminate hallucinated fake labels or wrong packaging.
+    4. Runs GPU-accelerated / Open-Source diffusion (FLUX.1-schnell / SDXL-IPAdapter) without 2D cutout pasting.
+    5. Automatically ingests the final visual directly into Sitecore DAM Create Tab (/en-us/create?p840=1).
     """
     width, height = ASPECT_RATIO_MAP.get(req.aspect_ratio, (1024, 1024))
 
@@ -303,20 +216,21 @@ def generate_from_prompt(req: PromptOnlyRequest):
     # Step 3: Extract Color & Style Intelligence
     style_info = extract_style_and_colors(req.prompt)
 
-    # Step 4: Build Multimodal Reference Prompt
-    prompt_used = build_multimodal_reference_prompt(
+    # Step 4: Build Physically-Grounded Master Prompt (Prevents Fake Jars & Gibberish Labels)
+    pos_prompt, neg_prompt = build_organic_master_prompt(
         user_prompt=req.prompt,
         brand_name=brand_name,
         product_name=product_name,
         brand_tagline=tagline,
-        style_info=style_info,
-        has_reference_images=len(reference_paths) > 0
+        detected_colors=style_info["detected_colors"],
+        ambience=style_info["ambience"]
     )
 
-    # Step 5: Execute Multimodal Reference Generation
-    logger.info("Step 5: Synthesizing commercial image with multimodal reference conditioning...")
-    final_image = run_multimodal_reference_generation(
-        prompt=prompt_used,
+    # Step 5: Execute Organic AI Generation (100% Native Diffusion - Zero 2D Pasting)
+    logger.info("Step 5: Synthesizing commercial image via OpenSourceDiffusionEngine...")
+    final_image = diffusion_engine.generate(
+        positive_prompt=pos_prompt,
+        negative_prompt=neg_prompt,
         reference_image_paths=reference_paths,
         width=width,
         height=height
@@ -350,15 +264,15 @@ def generate_from_prompt(req: PromptOnlyRequest):
 
     return UnifiedGenerationResponse(
         status='succeeded',
-        model=IMAGE_MODEL,
+        model=f"{IMAGE_MODEL} ({diffusion_engine.model_type})",
         brand=brand_name,
         product=product_name,
-        prompt_used=prompt_used,
+        prompt_used=pos_prompt,
         mime_type='image/jpeg',
         image_base64=image_b64,
         sitecore_asset_id=sitecore_asset_id,
         sitecore_create_url=create_tab_url,
-        note='Visual generated organically from Sitecore reference assets and stored in your Create tab.'
+        note='Visual synthesized organically by open-source diffusion grounded in DAM references (zero 2D cutout overlays) and stored in Create tab.'
     )
 
 @app.post('/api/chat')
