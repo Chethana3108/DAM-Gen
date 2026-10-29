@@ -121,3 +121,4 @@ class ProductIntegrator:
 
         logger.info(f"Integrated authentic product asset into scene at ({pos_x}, {pos_y}) [Size: {target_w}x{target_h}] with multi-layer AO.")
         return scene_rgba.convert("RGB")
+

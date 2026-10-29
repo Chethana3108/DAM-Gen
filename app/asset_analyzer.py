@@ -157,3 +157,4 @@ class AssetAnalyzer:
         unique, counts = np.unique(quantized, axis=0, return_counts=True)
         top_indices = np.argsort(counts)[::-1][:num_colors]
         return [tuple(int(c) for c in unique[idx]) for idx in top_indices]
+
