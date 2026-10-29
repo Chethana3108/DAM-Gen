@@ -1,0 +1,9 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+gradio_client>=2.7
+pydantic>=2.8
+python-dotenv>=1.0
+requests>=2.31.0
+pillow>=10.0.0
+rembg>=2.0.60
+beautifulsoup4>=4.12.0
