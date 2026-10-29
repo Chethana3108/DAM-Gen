@@ -26,11 +26,11 @@ class SitecoreDAMClient:
         client_id: Optional[str] = None,
         client_secret: Optional[str] = None,
     ):
-        self.ch_url = (ch_url or os.getenv("SITECORE_CH_URL", "")).rstrip("/")
-        self.username = username or os.getenv("SITECORE_USERNAME", "")
-        self.password = password or os.getenv("SITECORE_PASSWORD", "")
+        self.ch_url = (ch_url or os.getenv("SITECORE_CH_URL", "https://btr-q-002.sitecorecontenthub.cloud")).rstrip("/")
+        self.username = username or os.getenv("SITECORE_USERNAME", "kalpesh@biztechnosys.com")
+        self.password = password or os.getenv("SITECORE_PASSWORD", "P@ssw0rd7932")
         self.client_id = client_id or os.getenv("SITECORE_CLIENT_ID", "ImageUpload")
-        self.client_secret = client_secret or os.getenv("SITECORE_CLIENT_SECRET", "")
+        self.client_secret = client_secret or os.getenv("SITECORE_CLIENT_SECRET", "URXfOKv-j-GoHXp0KhiRhQS9oEpm1uNlFE_ZXLrb2qg")
         
         self._token: Optional[str] = None
         self._token_expiry: float = 0

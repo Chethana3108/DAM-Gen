@@ -723,7 +723,14 @@ CHAT_HTML = """
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ message: prompt })
         });
-        const data = await resp.json();
+        
+        let data = {};
+        const text = await resp.text();
+        try {
+          data = JSON.parse(text);
+        } catch(e) {
+          data = { detail: text || 'Server returned an error' };
+        }
 
         if (resp.ok) {
           const contentDiv = aiMsg.querySelector('.msg-content');
