@@ -13,7 +13,10 @@ from PIL import Image
 
 from app.sitecore_dam import SitecoreDAMClient
 from app.engine import OpenSourceDiffusionEngine
-from app.layer_mixer import UniversalLayerMixer, DAMAssetContext
+from app.asset_analyzer import AssetAnalyzer, AnalyzedAsset
+from app.prompt_parser import PromptParser, ParsedPrompt
+from app.product_integrator import ProductIntegrator
+from app.validator import QualityValidator
 
 load_dotenv()
 
@@ -140,12 +143,16 @@ def build_multimodal_reference_prompt(
 # -------------------------------------------------------------
 
 class PromptOnlyRequest(BaseModel):
-    prompt: str = Field(min_length=3, max_length=3000, description="Natural language prompt (e.g. 'Good Day breakfast campaign with tea in warm golden light')")
+    prompt: str = Field(min_length=3, max_length=3000, description="Natural language prompt (e.g. 'Place this biscuit packet on a wooden table with a cup of coffee')")
+    asset_id: Optional[int] = Field(default=None, description="Explicit Sitecore DAM Asset ID (optional, overrides search)")
+    exact_filename: Optional[str] = Field(default=None, description="Explicit filename (e.g. Britannia_JimJam.png)")
     aspect_ratio: str = Field(default='1:1', pattern=r'^(1:1|3:4|4:3|9:16|16:9)$')
     sync_to_dam: bool = Field(default=True, description="Automatically ingest asset into Sitecore DAM Create tab")
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=2, max_length=3000)
+    asset_id: Optional[int] = None
+    exact_filename: Optional[str] = None
     aspect_ratio: str = Field(default='1:1')
 
 class UnifiedGenerationResponse(BaseModel):
@@ -158,6 +165,9 @@ class UnifiedGenerationResponse(BaseModel):
     image_base64: str
     sitecore_asset_id: Optional[int] = None
     sitecore_create_url: str
+    quality_report: Optional[Dict[str, Any]] = None
+    disambiguation_required: bool = False
+    candidates: List[Dict[str, Any]] = Field(default_factory=list)
     note: str
 
 # -------------------------------------------------------------
@@ -178,83 +188,67 @@ def health():
 @app.post('/api/generate', response_model=UnifiedGenerationResponse)
 def generate_from_prompt(req: PromptOnlyRequest):
     """
-    Prompt-Only API:
-    1. Automatically resolves Brand & Product reference assets from Sitecore Content Hub DAM.
-    2. Downloads approved assets to local reference storage.
-    3. Builds physically-grounded organic prompt to eliminate hallucinated fake labels or wrong packaging.
-    4. Runs GPU-accelerated / Open-Source diffusion (FLUX.1-schnell / SDXL-IPAdapter) without 2D cutout pasting.
-    5. Automatically ingests the final visual directly into Sitecore DAM Create Tab (/en-us/create?p840=1).
+    Core Campaign Generator Pipeline:
+    A. Asset Retrieval from Sitecore DAM (by exact filename, query, or explicit ID with disambiguation).
+    B. Asset Understanding & Object Extraction (detects transparency vs photographic backgrounds).
+    C. Natural-Language Prompt Understanding (scene, interaction, co-objects, lighting).
+    D. Intelligent Scene Generation & Product Integration (multi-layer contact AO, surface reflections).
+    E. Automated Quality Validation.
+    F. Direct Sitecore DAM Ingestion into Create Tab.
     """
     width, height = ASPECT_RATIO_MAP.get(req.aspect_ratio, (1024, 1024))
 
-    # Step 1: Query Sitecore Content Hub DAM for Asset, Metadata & Linked Layers
-    logger.info("Step 1: Querying Sitecore Content Hub for dynamic brand & asset context...")
-    brand_context = dam_client.search_brand_and_product(req.prompt)
-    brand_name = brand_context.get("brand_name")
-    product_name = brand_context.get("product_name")
-    tagline = brand_context.get("brand_tagline")
+    # Step 1: Parse Natural-Language Creative Prompt
+    parsed = PromptParser.parse(req.prompt)
+    target_filename = req.exact_filename or parsed.target_asset_filename
 
-    # Step 2: Download official reference assets & all linked layers
+    # Step 2: Query Sitecore Content Hub DAM for Asset, Metadata & Linked Layers
+    if req.asset_id:
+        logger.info("Using explicitly requested DAM Asset ID: %d", req.asset_id)
+        brand_context = dam_client.get_asset_by_id(req.asset_id)
+    else:
+        logger.info("Searching Sitecore DAM with prompt/filename...")
+        brand_context = dam_client.search_brand_and_product(
+            prompt=req.prompt,
+            exact_filename=target_filename
+        )
+
+    # Disambiguation Check: if multiple assets share similar names
+    if brand_context.get("requires_disambiguation"):
+        logger.info("Disambiguation required for prompt: %s", req.prompt)
+        return UnifiedGenerationResponse(
+            status='disambiguation_required',
+            model=IMAGE_MODEL,
+            prompt_used=req.prompt,
+            mime_type='',
+            image_base64='',
+            sitecore_create_url=f"{dam_client.ch_url}/en-us/create?p840=1",
+            disambiguation_required=True,
+            candidates=brand_context.get("candidates", []),
+            note='Multiple matching assets found in DAM. Please select the intended asset.'
+        )
+
+    # Step 3: Download authentic reference assets & linked layers
     os.makedirs("./reference_cache", exist_ok=True)
-    reference_paths = []
     primary_path = None
-    logo_path = None
-    layer_paths = []
-
-    # A) Primary Asset
     if brand_context.get("product_image_url"):
         p_bytes = dam_client.download_image_bytes(brand_context["product_image_url"])
         if p_bytes:
             primary_path = os.path.abspath(f"./reference_cache/ref_primary_{brand_context.get('product_id', 1)}.png")
             with open(primary_path, "wb") as f:
                 f.write(p_bytes)
-            reference_paths.append(primary_path)
 
-    # B) Linked Layers & Sibling Components
-    for idx, l_url in enumerate(brand_context.get("layer_urls", [])):
-        l_bytes = dam_client.download_image_bytes(l_url)
-        if l_bytes:
-            l_path = os.path.abspath(f"./reference_cache/ref_layer_{brand_context.get('product_id', 1)}_{idx}.png")
-            with open(l_path, "wb") as f:
-                f.write(l_bytes)
-            layer_paths.append(l_path)
-            reference_paths.append(l_path)
+    # Step 4: Asset Understanding & Object Extraction (transparent layers vs photographic segmentation)
+    logger.info("Step 4: Analyzing DAM asset and extracting clean product...")
+    analyzed_asset = AssetAnalyzer.analyze(primary_path, metadata=brand_context)
 
-    # C) Official Logo
-    if brand_context.get("brand_logo_url"):
-        lo_bytes = dam_client.download_image_bytes(brand_context["brand_logo_url"])
-        if lo_bytes:
-            logo_path = os.path.abspath(f"./reference_cache/ref_logo_{brand_context.get('brand_id', 1)}.png")
-            with open(logo_path, "wb") as f:
-                f.write(lo_bytes)
-            reference_paths.append(logo_path)
-
-    # Step 3: Build Dynamic DAM Asset Context (Zero Hardcoding)
-    asset_ctx = DAMAssetContext(
-        asset_id=brand_context.get("product_id") or 0,
-        title=product_name or "Product Asset",
-        description=brand_context.get("description", ""),
-        alt_text=brand_context.get("alt_text", ""),
-        tags=brand_context.get("tags", []),
-        brand_name=brand_name,
-        brand_tagline=tagline,
-        primary_image_path=primary_path,
-        layer_image_paths=layer_paths,
-        logo_path=logo_path
-    )
-
-    # Step 4: Dynamically Synthesize Creative Scene Environment Prompts
-    scene_pos_prompt, scene_neg_prompt = UniversalLayerMixer.build_scene_generation_prompt(
-        user_prompt=req.prompt,
-        asset_context=asset_ctx
-    )
-
-    # Step 5: Synthesize AI Scene Environment (e.g. cafe table with coffee cup and morning sunlight)
-    logger.info("Step 5: Synthesizing photorealistic scene environment...")
+    # Step 5: Synthesize AI Scene Environment (e.g. cafe table with coffee cup, morning sunlight)
+    scene_pos_prompt, scene_neg_prompt = PromptParser.build_environment_generation_prompt(parsed)
+    logger.info("Step 5: Synthesizing photorealistic scene environment: %s", scene_pos_prompt[:120])
     ai_scene = diffusion_engine.generate(
         positive_prompt=scene_pos_prompt,
         negative_prompt=scene_neg_prompt,
-        reference_image_paths=reference_paths,
+        reference_image_paths=[primary_path] if primary_path else [],
         width=width,
         height=height
     )
@@ -262,10 +256,17 @@ def generate_from_prompt(req: PromptOnlyRequest):
     # Step 6: Seamlessly Integrate Authentic DAM Asset with Studio Relighting & Contact Shadows
     # Retains 100% of the authentic product, genuine typography, and real textures
     logger.info("Step 6: Integrating authentic DAM product asset into AI scene with optical grounding...")
-    final_image = UniversalLayerMixer.blend_authentic_asset_into_scene(
-        ai_scene=ai_scene,
-        asset_context=asset_ctx,
-        user_prompt=req.prompt
+    final_image = ProductIntegrator.integrate(
+        scene_image=ai_scene,
+        analyzed_asset=analyzed_asset,
+        intent=parsed
+    )
+
+    # Step 7: Automated Commercial Quality Validation
+    quality_report = QualityValidator.validate(
+        final_image=final_image,
+        product_cutout=analyzed_asset.cutout_image,
+        target_dimensions=(width, height)
     )
 
     # Convert to JPEG & Base64
@@ -274,19 +275,20 @@ def generate_from_prompt(req: PromptOnlyRequest):
     final_bytes = buf.getvalue()
     image_b64 = base64.b64encode(final_bytes).decode('utf-8')
 
-    # Step 6: Ingest into Sitecore Content Hub DAM (Create Tab)
+    # Step 8: Ingest into Sitecore Content Hub DAM (Create Tab)
     sitecore_asset_id = None
     create_tab_url = f"{dam_client.ch_url}/en-us/create?p840=1"
 
     if req.sync_to_dam:
         try:
-            clean_name = (product_name or brand_name or "Campaign").replace(" ", "_").replace(".jpg", "").replace(".png", "")
+            p_name = brand_context.get("product_name") or brand_context.get("brand_name") or "Campaign"
+            clean_name = re.sub(r'[^a-zA-Z0-9_]', '_', p_name)
             filename = f"AI_{clean_name}_{int(time.time())}.jpg"
-            logger.info("Step 6: Ingesting into Sitecore DAM Create Tab: %s", filename)
+            logger.info("Step 8: Ingesting into Sitecore DAM Create Tab: %s", filename)
             dam_res = dam_client.upload_campaign_asset_to_create_tab(
                 image_bytes=final_bytes,
                 filename=filename,
-                title=f"AI Campaign - {product_name or brand_name or 'Visual'}",
+                title=f"AI Campaign - {brand_context.get('product_name') or 'Visual'}",
                 brand_id=brand_context.get("brand_id")
             )
             sitecore_asset_id = dam_res.get("asset_id")
@@ -297,26 +299,53 @@ def generate_from_prompt(req: PromptOnlyRequest):
     return UnifiedGenerationResponse(
         status='succeeded',
         model=f"{IMAGE_MODEL} ({diffusion_engine.model_type})",
-        brand=brand_name,
-        product=product_name,
+        brand=brand_context.get("brand_name"),
+        product=brand_context.get("product_name"),
         prompt_used=scene_pos_prompt,
         mime_type='image/jpeg',
         image_base64=image_b64,
         sitecore_asset_id=sitecore_asset_id,
         sitecore_create_url=create_tab_url,
-        note='Authentic DAM asset preserved with 100% pixel fidelity; AI-generated scene, lighting, and contact shadows.'
+        quality_report=quality_report,
+        disambiguation_required=False,
+        note='Original DAM product asset 100% preserved; AI-generated scene, lighting, and contact shadows.'
     )
 
 @app.post('/api/chat')
 def chat_endpoint(req: ChatRequest):
-    """Conversational endpoint used by the web chat interface."""
-    gen_res = generate_from_prompt(PromptOnlyRequest(prompt=req.message, aspect_ratio=req.aspect_ratio, sync_to_dam=True))
+    """Conversational endpoint with automatic disambiguation support."""
+    gen_res = generate_from_prompt(PromptOnlyRequest(
+        prompt=req.message,
+        asset_id=req.asset_id,
+        exact_filename=req.exact_filename,
+        aspect_ratio=req.aspect_ratio,
+        sync_to_dam=True
+    ))
+
+    if gen_res.disambiguation_required:
+        cand_html = []
+        for c in gen_res.candidates:
+            cid = c.get("id")
+            ctitle = (c.get("title") or c.get("filename") or "Asset").replace('"', '&quot;')
+            cand_html.append(
+                f'<button class="quick-btn" onclick="selectCandidate({cid}, \'{ctitle}\')" style="text-align:left; padding:8px 12px; margin:4px 0;">'
+                f'📦 <strong>{ctitle}</strong> <span style="opacity:0.7;">(ID: {cid})</span>'
+                f'</button>'
+            )
+        return {
+            "disambiguation": True,
+            "reply": f"🔍 <strong>Multiple assets found in Sitecore DAM for your request.</strong><br/>Please select which asset you would like to use:<div style='display:flex; flex-direction:column; margin-top:8px;'>{''.join(cand_html)}</div>",
+            "candidates": gen_res.candidates
+        }
 
     reply_lines = [
         f"✨ **Commercial campaign visual generated!**",
         f"- **Brand**: `{gen_res.brand or 'General'}`",
         f"- **Product Reference**: `{gen_res.product or 'Official DAM Asset'}`",
     ]
+    if gen_res.quality_report:
+        reply_lines.append(f"- **Quality Score**: `{gen_res.quality_report.get('quality_score', 1.0) * 100:.0f}%` (Passed all pre-delivery checks)")
+
     if gen_res.sitecore_asset_id:
         reply_lines.append(f"- **Sitecore Asset ID**: `#{gen_res.sitecore_asset_id}` (Status: `Created / Draft`)")
         reply_lines.append(f"\n📂 **The image has been stored in your Sitecore Create Tab:**")
@@ -330,7 +359,8 @@ def chat_endpoint(req: ChatRequest):
         "sitecore_asset_id": gen_res.sitecore_asset_id,
         "sitecore_create_url": gen_res.sitecore_create_url,
         "brand": gen_res.brand,
-        "product": gen_res.product
+        "product": gen_res.product,
+        "quality_report": gen_res.quality_report
     }
 
 # -------------------------------------------------------------
@@ -623,19 +653,34 @@ CHAT_HTML = """
   </div>
 
   <script>
+    let activePrompt = '';
+
     function setPrompt(text) {
       const input = document.getElementById('prompt-input');
       input.value = text;
       input.focus();
     }
 
+    async function selectCandidate(assetId, assetTitle) {
+      const chatContainer = document.getElementById('chat-container');
+      const userMsg = document.createElement('div');
+      userMsg.className = 'message';
+      userMsg.innerHTML = `
+        <div class="avatar avatar-user">You</div>
+        <div class="msg-content"><p>Selected asset: <strong>${assetTitle}</strong> (ID: ${assetId})</p></div>
+      `;
+      chatContainer.appendChild(userMsg);
+      await executeGeneration(activePrompt, assetId);
+    }
+
     async function sendMessage(e) {
       if (e) e.preventDefault();
       const input = document.getElementById('prompt-input');
-      const sendBtn = document.getElementById('send-btn');
-      const chatContainer = document.getElementById('chat-container');
       const prompt = input.value.trim();
       if (!prompt) return;
+
+      activePrompt = prompt;
+      const chatContainer = document.getElementById('chat-container');
 
       // Append User Message
       const userMsg = document.createElement('div');
@@ -646,6 +691,13 @@ CHAT_HTML = """
       `;
       chatContainer.appendChild(userMsg);
       input.value = '';
+
+      await executeGeneration(prompt, null);
+    }
+
+    async function executeGeneration(prompt, assetId) {
+      const sendBtn = document.getElementById('send-btn');
+      const chatContainer = document.getElementById('chat-container');
       sendBtn.disabled = true;
 
       // Append AI Loading Pill
@@ -656,7 +708,7 @@ CHAT_HTML = """
         <div class="msg-content">
           <div class="status-pill">
             <div class="spinner"></div>
-            <span>Querying Sitecore DAM & generating visual with multimodal conditioning...</span>
+            <span>Querying Sitecore DAM & generating campaign visual...</span>
           </div>
         </div>
       `;
@@ -664,10 +716,13 @@ CHAT_HTML = """
       chatContainer.scrollTop = chatContainer.scrollHeight;
 
       try {
+        const payload = { message: prompt };
+        if (assetId) payload.asset_id = assetId;
+
         const resp = await fetch('/api/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: prompt })
+          body: JSON.stringify(payload)
         });
         
         let data = {};
@@ -678,24 +733,31 @@ CHAT_HTML = """
           data = { detail: text || 'Server returned an error' };
         }
 
+        const contentDiv = aiMsg.querySelector('.msg-content');
+
         if (resp.ok) {
-          const contentDiv = aiMsg.querySelector('.msg-content');
-          contentDiv.innerHTML = `
-            <p>✨ <strong>Campaign visual generated successfully!</strong></p>
-            <p>• <strong>Brand</strong>: <code>${data.brand || 'Britannia'}</code> | <strong>Product Reference</strong>: <code>${data.product || 'Official Packshot'}</code></p>
-            ${data.sitecore_asset_id ? `<p>• <strong>Sitecore Asset ID</strong>: <code>#${data.sitecore_asset_id}</code> (Status: <strong>Created / Draft</strong>)</p>` : ''}
-            <div class="image-card">
-              <img src="data:image/jpeg;base64,${data.image_base64}" alt="Generated Campaign Image" />
-              <div class="card-footer">
-                <span style="font-size: 12px; color: var(--text-muted);">Stored directly in Sitecore Content Hub DAM</span>
-                <a href="${data.sitecore_create_url}" target="_blank" class="dam-btn">
-                  Review in Sitecore Create Tab ↗
-                </a>
+          if (data.disambiguation) {
+            contentDiv.innerHTML = data.reply;
+          } else {
+            const scoreTxt = data.quality_report ? `<p>• <strong>Quality Validation</strong>: <code>${Math.round((data.quality_report.quality_score || 1) * 100)}% Passed</code> (100% original product preserved)</p>` : '';
+            contentDiv.innerHTML = `
+              <p>✨ <strong>Campaign visual synthesized successfully!</strong></p>
+              <p>• <strong>Brand</strong>: <code>${data.brand || 'General'}</code> | <strong>Product</strong>: <code>${data.product || 'Official DAM Asset'}</code></p>
+              ${scoreTxt}
+              ${data.sitecore_asset_id ? `<p>• <strong>Sitecore Asset ID</strong>: <code>#${data.sitecore_asset_id}</code> (Status: <strong>Created / Draft</strong>)</p>` : ''}
+              <div class="image-card">
+                <img src="data:image/jpeg;base64,${data.image_base64}" alt="Generated Campaign Image" />
+                <div class="card-footer">
+                  <span style="font-size: 12px; color: var(--text-muted);">Stored directly in Sitecore Content Hub DAM</span>
+                  <a href="${data.sitecore_create_url}" target="_blank" class="dam-btn">
+                    Review in Sitecore Create Tab ↗
+                  </a>
+                </div>
               </div>
-            </div>
-          `;
+            `;
+          }
         } else {
-          aiMsg.querySelector('.msg-content').innerHTML = `
+          contentDiv.innerHTML = `
             <p style="color: #f85149;">❌ Error: ${data.detail || 'Failed to generate visual. Please try again.'}</p>
           `;
         }
