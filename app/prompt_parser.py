@@ -164,12 +164,11 @@ class PromptParser:
         analyzed_asset: Optional[Any] = None
     ) -> Tuple[str, str]:
         """
-        Builds a state-of-the-art FLUX.1 / FLUX.2 commercial master prompt that:
-        1. Dynamically extracts brand, product typography, and packaging descriptors from Sitecore DAM metadata.
-        2. Quotes exact brand text (e.g. "Jim Jam", "BRITANNIA") so FLUX's T5-XXL text encoder renders it cleanly.
-        3. Seamlessly unifies the authentic product with the user's requested environment and props.
-        4. Guarantees 100% organic photorealism with physical lighting, contact shadows, and zero rectangular collage borders.
-        100% Dynamic - Zero hardcoding, works for any brand or industry.
+        Builds a state-of-the-art FLUX.2 / FLUX.1 commercial master prompt that:
+        1. Translates any natural language request and DAM asset metadata into professional commercial advertising instructions.
+        2. Quotes exact brand typography (e.g. "Jim Jam", "BRITANNIA") for FLUX's T5-XXL text reasoning encoder.
+        3. Instructs the model to ground natively in the reference asset without creating flat collage insets or pasted screenshots.
+        4. 100% Dynamic - Zero hardcoding, works for any brand or industry.
         """
         # 1. Extract brand & product identity from DAM metadata
         brand = brand_context.get("brand_name")
@@ -219,31 +218,33 @@ class PromptParser:
 
         # Interaction & Environment placement
         if parsed.interaction_mode == "handheld_person":
-            placement_clause = f"In {parsed.scene_environment}, a person's hands are gracefully holding an authentic {prod_visual_desc} {text_clause} facing clearly toward the camera"
+            placement_clause = f"In {parsed.scene_environment}, a model's hands gracefully hold an authentic {prod_visual_desc} {text_clause} facing clearly toward the camera"
         elif parsed.interaction_mode == "dynamic_action":
             placement_clause = f"Suspended dynamically in {parsed.scene_environment} is an authentic {prod_visual_desc} {text_clause}"
         else:
-            placement_clause = f"On {parsed.scene_environment} in the foreground rests an authentic {prod_visual_desc} {text_clause}"
+            placement_clause = f"Place the original authentic {prod_visual_desc} {text_clause} naturally on {parsed.scene_environment} in the foreground"
 
         # Co-objects
-        co_obj_clause = f"Beside it sits {', '.join(parsed.co_objects)}." if parsed.co_objects else ""
+        co_obj_clause = f"beside {', '.join(parsed.co_objects)}." if parsed.co_objects else "."
 
         pos_parts = [
-            "Commercial advertising master shot photography:",
-            placement_clause + ".",
+            "Create a premium, photorealistic commercial advertising photograph featuring the exact product shown in the supplied reference asset.",
+            placement_clause,
             co_obj_clause,
-            f"Lighting: {parsed.lighting_style}.",
-            "Realistic contact shadows on the surface, natural ambient occlusion, subtle table reflection, atmospheric background bokeh with soft depth of field.",
-            "Photorealistic 8k, Hasselblad H6D-100c medium format camera with 85mm f/1.4 lens, razor-sharp focus, professional commercial color grading."
+            f"Use {parsed.lighting_style}, realistic contact shadows, physically consistent lighting, natural perspective, accurate object scale, detailed material textures, and professional commercial photography.",
+            f"Use the reference asset to identify the product and preserve its recognizable packaging, wrapper, logo, label, and appearance as accurately as possible. Integrate the product naturally into the generated environment.",
+            "Shot on Hasselblad H6D-100c medium format camera with 85mm f/1.4 lens, 8k resolution, razor-sharp focus on the product, and professional commercial color grading."
         ]
         pos_prompt = " ".join([p for p in pos_parts if p.strip()])
 
         neg_parts = [
-            "deformed, blurry, ugly, low quality, noise, grain, cartoon, illustration, drawing",
-            "fake misspelled labels, distorted packaging, garbled letters, amateur lighting",
-            "watermark, signature, flat rectangular cutout, border, frame, collage"
+            "Generate a single, coherent photograph.",
+            "Do not include the original source photograph as an inset, rectangle, collage, thumbnail, picture-in-picture, or pasted background.",
+            "Do not reproduce the original photograph's background unless explicitly requested.",
+            "Do not add frames, borders, duplicated product packages, unrelated objects, distorted packaging, misspelled labels, watermark, signature, or unwanted graphic elements.",
+            "deformed, blurry, ugly, low quality, noise, grain, cartoon, illustration, drawing"
         ]
-        neg_prompt = ", ".join(neg_parts)
+        neg_prompt = " ".join(neg_parts)
 
         return pos_prompt, neg_prompt
 

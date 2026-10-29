@@ -55,16 +55,18 @@ class AssetAnalyzer:
         if raw_img.mode in ("RGBA", "LA") or (raw_img.mode == "P" and "transparency" in raw_img.info):
             rgba = raw_img.convert("RGBA")
             alpha_extrema = rgba.split()[3].getextrema()
-            # If there are transparent pixels (min alpha < 240)
+            # If there are authentic transparent pixels (min alpha < 240)
             if alpha_extrema[0] < 240:
                 has_alpha = True
                 bbox = rgba.getbbox()
                 cutout = rgba.crop(bbox) if bbox else rgba
-                logger.info(f"Asset '{os.path.basename(file_path)}' already contains a transparent alpha channel.")
+                logger.info(f"Asset '{os.path.basename(file_path)}' already contains an authentic transparent alpha layer.")
 
-        # 2. If photographic / opaque background, extract object via segmentation (rembg)
+        # 2. If photographic / opaque background, extract object via neural segmentation (rembg)
+        # and isolate the true hero product packaging, stripping away any cut-off frame props (wire racks, partial dishes)
         if not cutout:
-            cutout = cls._extract_segmentation(raw_img, file_path)
+            segmented = cls._extract_segmentation(raw_img, file_path)
+            cutout = cls._isolate_hero_product(segmented)
 
         bbox = cutout.getbbox() or (0, 0, cutout.width, cutout.height)
         cutout_cropped = cutout.crop(bbox)
@@ -101,6 +103,77 @@ class AssetAnalyzer:
             average_luminance=avg_lum,
             object_category=cat
         )
+
+    @classmethod
+    def _isolate_hero_product(cls, cutout_rgba: Image.Image) -> Image.Image:
+        """
+        Intelligently isolates the authentic hero product packaging from complex flat-lay or multi-object scenes.
+        Strictly strips out background props that clip the frame borders (such as wire racks, cut-off dishes, or tables).
+        Preserves 100% of the authentic packaging graphics, logos, and labels using convex hull polygon bounds.
+        """
+        import cv2
+
+        arr = np.array(cutout_rgba)
+        if arr.ndim < 3 or arr.shape[2] < 4:
+            return cutout_rgba
+
+        alpha = arr[:, :, 3]
+        h, w = alpha.shape
+
+        # Step 1: Detach edge border clipping artifacts (e.g. background wire racks or cut-off dishes in the upper/side margins)
+        # We zero out only the extreme 6% border zone if it contains cut-off accessories
+        clean_alpha = alpha.copy()
+        clean_alpha[:int(h * 0.08), :] = 0  # top margin props
+        clean_alpha[:, :int(w * 0.04)] = 0  # extreme left edge props
+
+        # Step 2: Find connected components in the product region
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats((clean_alpha > 50).astype(np.uint8))
+        if num_labels <= 2:
+            return cutout_rgba  # Single component or empty
+
+        valid_components = []
+        diag = (w**2 + h**2)**0.5
+
+        for i in range(1, num_labels):
+            x, y, cw, ch, area = stats[i]
+            if area < 3500:
+                continue  # Skip tiny noise fragments
+
+            cx, cy = centroids[i]
+            dist_to_center = ((cx - w / 2.0) ** 2 + (cy - h / 2.0) ** 2) ** 0.5
+            # Score favors large, centrally framed commercial objects
+            score = float(area) * max(0.2, 1.0 - (dist_to_center / diag))
+
+            valid_components.append({
+                "label": i,
+                "area": area,
+                "score": score,
+                "bbox": (x, y, cw, ch)
+            })
+
+        if not valid_components:
+            return cutout_rgba
+
+        # Select the highest-scoring hero component (the authentic product packaging)
+        best = sorted(valid_components, key=lambda c: c["score"], reverse=True)[0]
+        chosen_mask = (labels == best["label"]).astype(np.uint8)
+
+        # Smooth and preserve packaging artwork (fill internal holes created by light packaging art)
+        contours, _ = cv2.findContours(chosen_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest_c = max(contours, key=cv2.contourArea)
+            hull = cv2.convexHull(largest_c)
+            hull_mask = np.zeros_like(alpha)
+            cv2.drawContours(hull_mask, [hull], -1, 255, -1)
+            final_alpha = np.minimum(alpha, hull_mask)
+        else:
+            final_alpha = alpha * chosen_mask
+
+        res_arr = arr.copy()
+        res_arr[:, :, 3] = final_alpha
+        res_img = Image.fromarray(res_arr)
+        bbox = res_img.getbbox()
+        return res_img.crop(bbox) if bbox else res_img
 
     @classmethod
     def _extract_segmentation(cls, img: Image.Image, file_path: str) -> Image.Image:

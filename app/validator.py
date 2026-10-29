@@ -83,8 +83,35 @@ class QualityValidator:
 
     @classmethod
     def _check_no_rectangular_borders(cls, img: Image.Image) -> bool:
-        """Inspects for sharp unnatural rectangular box border artifacts."""
-        gray = img.convert("L")
-        arr = np.array(gray)
-        # Check that the image contains rich natural gradients across the entire frame
-        return bool(np.std(arr) > 15.0)
+        """
+        Inspects for sharp unnatural rectangular box border artifacts.
+        Uses gradient analysis to detect hard horizontal or vertical step lines
+        typical of cut-and-paste collage thumbnails.
+        """
+        try:
+            import cv2
+            gray = np.array(img.convert("L"))
+            # Compute Sobel gradients in X and Y
+            sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+            sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+            
+            # Check for excessive straight line edge accumulation
+            horiz_edges = np.sum(np.abs(sobely) > 100, axis=1)
+            vert_edges = np.sum(np.abs(sobelx) > 100, axis=0)
+
+            # In a natural photo, edge pixels are distributed smoothly.
+            # In a rectangular box overlay, a single row/col has a massive peak of edge pixels.
+            max_h_line = np.max(horiz_edges) / float(gray.shape[1])
+            max_v_line = np.max(vert_edges) / float(gray.shape[0])
+
+            # If a single straight line has > 85% sharp gradient cut, flag as box border
+            if max_h_line > 0.85 or max_v_line > 0.85:
+                logger.warning(f"Detected sharp rectangular border peak: horiz={max_h_line:.2f}, vert={max_v_line:.2f}")
+                return False
+
+            return bool(np.std(gray) > 15.0)
+        except Exception:
+            # Fallback statistical check
+            gray = img.convert("L")
+            arr = np.array(gray)
+            return bool(np.std(arr) > 15.0)

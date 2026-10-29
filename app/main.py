@@ -239,8 +239,12 @@ def generate_from_prompt(req: PromptOnlyRequest):
                 f.write(p_bytes)
 
     # Step 4: Asset Understanding & Object Extraction (transparent layers vs photographic segmentation)
-    logger.info("Step 4: Analyzing DAM asset and extracting clean product...")
+    logger.info("Step 4: Analyzing DAM asset and extracting clean hero product...")
     analyzed_asset = AssetAnalyzer.analyze(primary_path, metadata=brand_context)
+    
+    # Save the clean isolated product cutout for reference conditioning
+    isolated_cutout_path = os.path.abspath(f"./reference_cache/isolated_cutout_{brand_context.get('product_id', 1)}.png")
+    analyzed_asset.cutout_image.save(isolated_cutout_path)
 
     # Step 5: Commercial Image Generation Pipeline
     # Check model architecture: FLUX.2 / FLUX.1 vs SDXL / Hybrid
@@ -256,11 +260,11 @@ def generate_from_prompt(req: PromptOnlyRequest):
             brand_context=brand_context,
             analyzed_asset=analyzed_asset
         )
-        logger.info("Step 5: Synthesizing organic commercial visual with FLUX.1/FLUX.2: %s", master_pos_prompt[:140])
+        logger.info("Step 5: Synthesizing organic commercial visual with FLUX.2: %s", master_pos_prompt[:140])
         final_image = diffusion_engine.generate(
             positive_prompt=master_pos_prompt,
             negative_prompt=master_neg_prompt,
-            reference_image_paths=[primary_path] if primary_path else [],
+            reference_image_paths=[isolated_cutout_path, primary_path] if primary_path else [],
             width=width,
             height=height
         )
@@ -272,7 +276,7 @@ def generate_from_prompt(req: PromptOnlyRequest):
         ai_scene = diffusion_engine.generate(
             positive_prompt=scene_pos_prompt,
             negative_prompt=scene_neg_prompt,
-            reference_image_paths=[primary_path] if primary_path else [],
+            reference_image_paths=[isolated_cutout_path],
             width=width,
             height=height
         )
@@ -284,12 +288,42 @@ def generate_from_prompt(req: PromptOnlyRequest):
         )
         prompt_used = scene_pos_prompt
 
-    # Step 7: Automated Commercial Quality Validation
+    # Step 7: Automated Commercial Quality Validation & Controlled Retry Loop
     quality_report = QualityValidator.validate(
         final_image=final_image,
         product_cutout=analyzed_asset.cutout_image,
         target_dimensions=(width, height)
     )
+
+    max_retries = int(os.getenv("MAX_RETRIES", "2"))
+    retry_count = 0
+    while not quality_report.get("passed", False) and retry_count < max_retries:
+        retry_count += 1
+        logger.warning(
+            f"Quality validation check failed (Score: {quality_report.get('quality_score')}). "
+            f"Executing controlled retry #{retry_count} using hybrid relighting pipeline..."
+        )
+        # Retry with dedicated scene generation and optical product integration
+        scene_pos, scene_neg = PromptParser.build_environment_generation_prompt(parsed)
+        ai_scene = diffusion_engine.generate(
+            positive_prompt=scene_pos,
+            negative_prompt=scene_neg,
+            reference_image_paths=[isolated_cutout_path],
+            width=width,
+            height=height
+        )
+        final_image = ProductIntegrator.integrate(
+            scene_image=ai_scene,
+            analyzed_asset=analyzed_asset,
+            intent=parsed
+        )
+        quality_report = QualityValidator.validate(
+            final_image=final_image,
+            product_cutout=analyzed_asset.cutout_image,
+            target_dimensions=(width, height)
+        )
+        quality_report["retry_executed"] = retry_count
+        prompt_used = scene_pos
 
     # Convert to JPEG & Base64
     buf = io.BytesIO()

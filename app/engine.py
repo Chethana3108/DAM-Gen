@@ -62,8 +62,22 @@ class OpenSourceDiffusionEngine:
     ) -> Image.Image:
         """
         Generates the commercial visual organically using the best available model.
+        Priority:
+        1. Official Black Forest Labs API (FLUX.2 Max / Pro) if BFL_API_KEY is configured.
+        2. Local GPU Server Pipeline (FLUX.2-dev / schnell in CUDA bfloat16 on Vast.ai).
+        3. Multi-Reference Remote Endpoint (FLUX.2-dev on Hugging Face).
         """
-        # Option 1: GPU Server Pipeline (Vast.ai)
+        # Option 1: Official Black Forest Labs API (FLUX.2 Max)
+        bfl_res = self._generate_via_bfl_api(
+            positive_prompt=positive_prompt,
+            reference_image_paths=reference_image_paths,
+            width=width,
+            height=height
+        )
+        if bfl_res is not None:
+            return bfl_res
+
+        # Option 2: GPU Server Pipeline (Vast.ai)
         if self.has_cuda:
             try:
                 return self._generate_on_gpu(
@@ -77,7 +91,7 @@ class OpenSourceDiffusionEngine:
             except Exception as e:
                 logger.error(f"Local GPU generation error: {e}. Falling back to remote endpoint...")
 
-        # Option 2: Remote / API Pipeline (HF Spaces / FLUX endpoints)
+        # Option 3: Remote / API Pipeline (HF Spaces / FLUX endpoints)
         return self._generate_remote(
             positive_prompt=positive_prompt,
             negative_prompt=negative_prompt,
@@ -85,6 +99,77 @@ class OpenSourceDiffusionEngine:
             width=width,
             height=height
         )
+
+    def _generate_via_bfl_api(
+        self,
+        positive_prompt: str,
+        reference_image_paths: List[str],
+        width: int,
+        height: int
+    ) -> Optional[Image.Image]:
+        """
+        Invokes the official Black Forest Labs FLUX.2 Max / Pro API (https://api.bfl.ai/v1/flux-2-max).
+        Uses asynchronous submission and polling pattern.
+        """
+        import requests
+        import base64
+
+        bfl_key = os.getenv("BFL_API_KEY")
+        if not bfl_key:
+            return None
+
+        bfl_model = os.getenv("BFL_MODEL", "flux-2-max")
+        url = f"https://api.bfl.ai/v1/{bfl_model}"
+        headers = {
+            "accept": "application/json",
+            "x-key": bfl_key,
+            "Content-Type": "application/json"
+        }
+
+        payload: Dict[str, Any] = {
+            "prompt": positive_prompt,
+            "width": width,
+            "height": height,
+            "output_format": "jpeg"
+        }
+
+        # Multi-reference input support for BFL API
+        if reference_image_paths and os.path.exists(reference_image_paths[0]):
+            with open(reference_image_paths[0], "rb") as f:
+                b64_ref = base64.b64encode(f.read()).decode("utf-8")
+            payload["input_image"] = f"data:image/png;base64,{b64_ref}"
+
+        logger.info(f"Submitting task to Black Forest Labs API ({url})...")
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=30)
+            resp.raise_for_status()
+            sub_data = resp.json()
+            polling_url = sub_data.get("polling_url")
+            task_id = sub_data.get("id")
+            logger.info(f"BFL Task submitted successfully. Task ID: {task_id}")
+
+            # Asynchronous Polling loop
+            if polling_url:
+                start_time = time.time()
+                while time.time() - start_time < 120:
+                    poll_resp = requests.get(polling_url, headers={"x-key": bfl_key}, timeout=15)
+                    if poll_resp.status_code == 200:
+                        poll_data = poll_resp.json()
+                        status = poll_data.get("status")
+                        if status == "Ready":
+                            img_url = poll_data.get("result", {}).get("sample")
+                            if img_url:
+                                img_bytes = requests.get(img_url, timeout=30).content
+                                logger.info(f"Successfully generated visual via BFL API ({bfl_model})!")
+                                return Image.open(io.BytesIO(img_bytes))
+                        elif status in ["Error", "Failed"]:
+                            logger.error(f"BFL API generation failed: {poll_data}")
+                            break
+                    time.sleep(2)
+        except Exception as e:
+            logger.warning(f"BFL API invocation error: {e}. Falling back to standard pipeline...")
+
+        return None
 
     def _generate_on_gpu(
         self,
