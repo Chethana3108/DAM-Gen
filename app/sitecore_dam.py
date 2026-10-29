@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import time
 import logging
 import urllib.request
@@ -73,7 +74,9 @@ class SitecoreDAMClient:
     def search_brand_and_product(self, prompt: str) -> Dict[str, Any]:
         """
         Dynamically analyzes user prompt and retrieves matching brand details,
-        approved product packshot/render, and official brand logo from Sitecore DAM.
+        approved product asset, all linked layers (renditions, related sub-assets),
+        and official brand logo from Sitecore DAM.
+        Completely dynamic: Zero hardcoded brands, products, or industries.
         """
         token = self.get_token()
         headers = self._auth_headers()
@@ -87,11 +90,16 @@ class SitecoreDAMClient:
             "product_id": None,
             "product_name": None,
             "product_image_url": None,
+            "description": "",
+            "alt_text": "",
+            "tags": [],
+            "layer_urls": [],
             "matched_keywords": [],
         }
 
-        # 1. Query Brands from Sitecore Content Hub
-        brands_url = f"{self.ch_url}/api/entities/query?query=Definition.Name=='M.Brand'&take=20"
+        # 1. Query Brands Dynamically from Sitecore Content Hub
+        brands = []
+        brands_url = f"{self.ch_url}/api/entities/query?query=Definition.Name=='M.Brand'&take=50"
         try:
             r = requests.get(brands_url, headers=headers, timeout=10)
             if r.status_code == 200:
@@ -107,88 +115,192 @@ class SitecoreDAMClient:
                         tagline = props.get("BrandDescription", {}).get("en-US")
                         if tagline:
                             result["brand_tagline"] = tagline
-                        result["matched_keywords"].append(bname)
+                        result["matched_keywords"].append(f"Brand: {bname}")
                         break
-                
-                # If no brand explicitly mentioned, check if "good day" implies Britannia or default to first
-                if not result["brand_name"]:
-                    if any(w in prompt_lower for w in ["good day", "goodday", "biscuit", "cookie", "rusk", "bread", "cheese", "jim jam", "bourbon"]):
-                        result["brand_id"] = 70326
-                        result["brand_name"] = "Britannia"
-                        result["brand_tagline"] = "EXCITING GOODNESS IN EVERY BITE"
-                        result["matched_keywords"].append("Britannia (inferred)")
-                    elif len(brands) > 0:
-                        b = brands[0]
-                        result["brand_id"] = b.get("id")
-                        result["brand_name"] = b.get("properties", {}).get("BrandName", "Brand")
         except Exception as e:
             logger.warning(f"Error querying M.Brand: {e}")
 
-        # 2. Query Assets from DAM to find Product and Official Logo
+        # 2. Query Assets from DAM (Search across Title, Description, and File Name)
+        assets = []
         assets_query_url = f"{self.ch_url}/api/entities/query?query=Definition.Name=='M.Asset'&take=100"
         try:
             r_assets = requests.get(assets_query_url, headers=headers, timeout=12)
             if r_assets.status_code == 200:
                 assets = r_assets.json().get("items", [])
-                bname_lower = (result["brand_name"] or "").lower()
-                
-                # A. Find Official Logo
-                best_logo = None
-                for a in assets:
-                    props = a.get("properties", {})
-                    title = (props.get("Title") or "").lower()
-                    fname = (props.get("FileName") or "").lower()
-                    
-                    if "logo" in title or "logo" in fname:
-                        # Prioritize logo matching brand name (e.g. britannia_logo)
-                        if bname_lower and (bname_lower in title or bname_lower in fname):
-                            best_logo = a
-                            break
-                        elif not best_logo:
-                            best_logo = a
-                            
-                if best_logo:
-                    result["brand_logo_url"] = self._get_asset_delivery_url(best_logo.get("id"), preferred=["preview", "downloadPreview", "bigthumbnail", "downloadOriginal"])
-                    logger.info(f"Found official brand logo in DAM: Asset ID {best_logo.get('id')}")
-
-                # B. Find Matching Product Packshot / Render
-                best_match = None
-                best_score = 0
-                ignore = {"a", "an", "the", "in", "on", "at", "for", "with", "and", "or", "of", "to", "scene", "campaign", "image", "create", "visual", "photo"}
-                prompt_words = [w.strip(".,!?") for w in prompt_lower.split() if w.strip(".,!?") not in ignore and len(w) > 2]
-                
-                for a in assets:
-                    props = a.get("properties", {})
-                    title = (props.get("Title") or "").lower()
-                    fname = (props.get("FileName") or "").lower()
-                    combined = f"{title} {fname}"
-                    
-                    # Skip archives/media/logos
-                    if any(combined.endswith(ext) for ext in [".zip", ".pdf", ".mp4"]) or "logo" in combined:
-                        continue
-                        
-                    score = 0
-                    for pw in prompt_words:
-                        if pw in combined:
-                            score += 1
-                            
-                    # Special boost for phrase matches like "good day" or "goodday"
-                    if "good day" in prompt_lower or "goodday" in prompt_lower:
-                        if "goodday" in combined or "good day" in combined:
-                            score += 10
-                            
-                    if score > best_score:
-                        best_score = score
-                        best_match = a
-                        
-                if best_match and best_score > 0:
-                    result["product_id"] = best_match.get("id")
-                    result["product_name"] = best_match.get("properties", {}).get("Title")
-                    result["product_image_url"] = self._get_asset_delivery_url(best_match.get("id"), preferred=["downloadOriginal", "downloadPreview", "preview"])
-                    result["matched_keywords"].append(f"Product: {result['product_name']}")
-                    logger.info(f"Found product asset in DAM: Asset ID {result['product_id']} ({result['product_name']})")
         except Exception as e:
             logger.warning(f"Error querying DAM assets: {e}")
+
+        # Distinguish product keywords from generic scenario / setting words
+        context_words = {"table", "cup", "coffee", "tea", "desk", "counter", "surface", "background", "hand", "hands", "holding", "hold", "person", "celebrity", "woman", "man", "model", "morning", "night", "light", "sunlight", "outdoor", "indoor"}
+        stop_words = {"a", "an", "the", "in", "on", "at", "for", "with", "and", "or", "of", "to", "is", "like", "by", "scene", "campaign", "image", "create", "visual", "photo", "this", "that", "want", "you", "generate", "xyz", "particular", "some", "made", "placed", "where"}
+        all_ignore = stop_words | context_words
+
+        product_words = [w.strip(".,!?\"'") for w in prompt_lower.split() if w.strip(".,!?\"'") not in all_ignore and len(w.strip(".,!?\"'")) > 2]
+        # If all words were filtered out, fall back to non-stop words
+        if not product_words:
+            product_words = [w.strip(".,!?\"'") for w in prompt_lower.split() if w.strip(".,!?\"'") not in stop_words and len(w.strip(".,!?\"'")) > 2]
+
+        best_match = None
+        best_score = 0
+        candidate_assets = []
+
+        valid_image_exts = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff")
+
+        for a in assets:
+            props = a.get("properties", {})
+            title = (props.get("Title") or "").lower()
+            fname = (props.get("FileName") or "").lower()
+            desc = str(props.get("Description") or {}).lower()
+            alt = str(props.get("SC.Asset.AltText") or {}).lower()
+            combined = f"{title} {fname}"
+
+            # Strictly require valid image formats; reject video (.mp4), zip, pdf, etc.
+            if not any(fname.endswith(ext) for ext in valid_image_exts) or "logo" in combined:
+                continue
+
+            score = 0
+            combined_condensed = f"{title}{fname}".replace(" ", "").replace("_", "").replace("-", "")
+            for pw in product_words:
+                pw_clean = pw.replace(" ", "").replace("_", "").replace("-", "")
+                # Title and FileName matching carries highest product identity weight
+                if pw in combined:
+                    score += 10
+                if re.search(r'\b' + re.escape(pw) + r'\b', combined):
+                    score += 15
+                if len(pw_clean) > 3 and pw_clean in combined_condensed:
+                    score += 30
+                # Description and AltText carries secondary context weight
+                if pw in desc or pw in alt:
+                    score += 2
+
+            if score > 0:
+                candidate_assets.append((score, a))
+            if score > best_score:
+                best_score = score
+                best_match = a
+
+        # Fallback to first valid image asset if no direct keyword match
+        if not best_match and assets:
+            for a in assets:
+                fname = (a.get("properties", {}).get("FileName") or "").lower()
+                if any(fname.endswith(ext) for ext in valid_image_exts) and "logo" not in fname:
+                    best_match = a
+                    break
+
+        if best_match:
+            pid = best_match.get("id")
+            props = best_match.get("properties", {})
+            result["product_id"] = pid
+            result["product_name"] = props.get("Title") or props.get("FileName")
+            result["product_image_url"] = self._get_asset_delivery_url(pid, preferred=["downloadOriginal", "vision_ready", "preview", "downloadPreview"])
+            
+            # Extract detailed dynamic metadata
+            desc_dict = props.get("Description") or {}
+            result["description"] = desc_dict.get("en-US", "") if isinstance(desc_dict, dict) else str(desc_dict)
+            alt_dict = props.get("SC.Asset.AltText") or {}
+            result["alt_text"] = alt_dict.get("en-US", "") if isinstance(alt_dict, dict) else str(alt_dict)
+            
+            ai_sugg = props.get("AI.Suggestions") or {}
+            tag_suggestions = ai_sugg.get("TagToAsset", []) if isinstance(ai_sugg, dict) else []
+            sim_tags = [t.get("name") for t in (props.get("ImageSimilarityTags") or []) if isinstance(t, dict) and "name" in t]
+            result["tags"] = list(set(tag_suggestions + sim_tags))
+            result["matched_keywords"].append(f"Product: {result['product_name']}")
+            logger.info(f"Dynamically resolved product asset in DAM: ID {pid} ('{result['product_name']}')")
+
+            # 3. Dynamic Linked Layer Discovery
+            # A) Query relations on this asset for linked layers (RelatedAsset, AssetToLinkedAsset)
+            layer_ids = set()
+            try:
+                ent_url = f"{self.ch_url}/api/entities/{pid}"
+                ent_r = requests.get(ent_url, headers=headers, timeout=10)
+                if ent_r.status_code == 200:
+                    ent_data = ent_r.json()
+                    rels = ent_data.get("relations", {})
+                    for rel_key in ["RelatedAsset", "AssetToLinkedAsset", "MasterAssetToSubAsset", "IngredientImage"]:
+                        rel_info = rels.get(rel_key, {})
+                        for item in rel_info.get("children", []) + rel_info.get("parents", []):
+                            href = item.get("href", "")
+                            if href and "/api/entities/" in href:
+                                try:
+                                    lid = int(href.rstrip("/").split("/")[-1])
+                                    if lid != pid:
+                                        layer_ids.add(lid)
+                                except Exception:
+                                    pass
+
+                    # B) If Brand wasn't identified from prompt, infer from asset relations
+                    if not result["brand_name"]:
+                        for b_rel_key in ["PCMBrandToAsset", "BrandToAsset"]:
+                            b_rel = rels.get(b_rel_key, {})
+                            for b_item in b_rel.get("parents", []) + b_rel.get("children", []):
+                                href = b_item.get("href", "")
+                                if href and "/api/entities/" in href:
+                                    try:
+                                        bid = int(href.rstrip("/").split("/")[-1])
+                                        for b in brands:
+                                            if b.get("id") == bid:
+                                                result["brand_id"] = bid
+                                                result["brand_name"] = b.get("properties", {}).get("BrandName", "")
+                                                break
+                                    except Exception:
+                                        pass
+            except Exception as e:
+                logger.warning(f"Error inspecting entity relations for asset {pid}: {e}")
+
+            # C) Sibling layer assets: assets sharing the same product name root
+            clean_pname = re.sub(r'[_\-\s]+', ' ', (result["product_name"] or "").lower())
+            pname_tokens = [tok for tok in clean_pname.split() if len(tok) > 3 and tok not in all_ignore][:2]
+            if pname_tokens:
+                for score, cand in candidate_assets:
+                    cid = cand.get("id")
+                    if cid != pid and cid not in layer_ids:
+                        c_title = (cand.get("properties", {}).get("Title") or "").lower()
+                        c_file = (cand.get("properties", {}).get("FileName") or "").lower()
+                        if any(tok in c_title or tok in c_file for tok in pname_tokens):
+                            layer_ids.add(cid)
+                            logger.info(f"Discovered linked sibling layer asset: ID {cid} ('{c_title}')")
+
+            # Resolve delivery URLs for all discovered layer assets
+            for lid in layer_ids:
+                l_url = self._get_asset_delivery_url(lid, preferred=["downloadOriginal", "vision_ready", "preview", "downloadPreview"])
+                if l_url and l_url not in result["layer_urls"]:
+                    result["layer_urls"].append(l_url)
+                    logger.info(f"Attached linked layer from DAM: Asset ID {lid}")
+
+            # D) Check renditions on the primary asset for alternative layer files
+            try:
+                rend_url = f"{self.ch_url}/api/entities/{pid}/renditions"
+                r_rend = requests.get(rend_url, headers=headers, timeout=10)
+                if r_rend.status_code == 200:
+                    for ritem in r_rend.json().get("renditions", []):
+                        rname = (ritem.get("rendition_link", {}).get("name") or "").lower()
+                        if any(k in rname for k in ["alternative", "transparent", "layer", "cutout"]):
+                            files = ritem.get("file_location", {}).get("files", [])
+                            if files and "delivery_link" in files[0]:
+                                l_href = files[0]["delivery_link"]["href"]
+                                if l_href not in result["layer_urls"]:
+                                    result["layer_urls"].append(l_href)
+                                    logger.info(f"Attached linked layer rendition '{rname}' from Asset {pid}")
+            except Exception as e:
+                logger.warning(f"Error checking layer renditions: {e}")
+
+        # 4. Dynamic Brand Logo Discovery
+        bname_lower = (result["brand_name"] or "").lower()
+        best_logo = None
+        for a in assets:
+            props = a.get("properties", {})
+            title = (props.get("Title") or "").lower()
+            fname = (props.get("FileName") or "").lower()
+            if "logo" in title or "logo" in fname:
+                if bname_lower and (bname_lower in title or bname_lower in fname):
+                    best_logo = a
+                    break
+                elif not best_logo:
+                    best_logo = a
+
+        if best_logo:
+            result["brand_logo_url"] = self._get_asset_delivery_url(best_logo.get("id"), preferred=["preview", "downloadPreview", "bigthumbnail", "downloadOriginal"])
+            logger.info(f"Found official brand logo in DAM: Asset ID {best_logo.get('id')}")
 
         return result
 

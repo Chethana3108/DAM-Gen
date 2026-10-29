@@ -12,7 +12,8 @@ from pydantic import BaseModel, Field
 from PIL import Image
 
 from app.sitecore_dam import SitecoreDAMClient
-from app.engine import OpenSourceDiffusionEngine, build_organic_master_prompt
+from app.engine import OpenSourceDiffusionEngine
+from app.layer_mixer import UniversalLayerMixer, DAMAssetContext
 
 load_dotenv()
 
@@ -186,48 +187,70 @@ def generate_from_prompt(req: PromptOnlyRequest):
     """
     width, height = ASPECT_RATIO_MAP.get(req.aspect_ratio, (1024, 1024))
 
-    # Step 1: Query Sitecore Content Hub DAM
-    logger.info("Step 1: Querying Sitecore Content Hub for brand & product context...")
+    # Step 1: Query Sitecore Content Hub DAM for Asset, Metadata & Linked Layers
+    logger.info("Step 1: Querying Sitecore Content Hub for dynamic brand & asset context...")
     brand_context = dam_client.search_brand_and_product(req.prompt)
     brand_name = brand_context.get("brand_name")
     product_name = brand_context.get("product_name")
     tagline = brand_context.get("brand_tagline")
 
-    # Step 2: Download official reference assets to temporary scratch files
+    # Step 2: Download official reference assets & all linked layers
     os.makedirs("./reference_cache", exist_ok=True)
     reference_paths = []
+    primary_path = None
+    logo_path = None
+    layer_paths = []
 
+    # A) Primary Asset
     if brand_context.get("product_image_url"):
         p_bytes = dam_client.download_image_bytes(brand_context["product_image_url"])
         if p_bytes:
-            p_path = os.path.abspath(f"./reference_cache/ref_product_{brand_context.get('product_id', 1)}.jpg")
-            with open(p_path, "wb") as f:
+            primary_path = os.path.abspath(f"./reference_cache/ref_primary_{brand_context.get('product_id', 1)}.png")
+            with open(primary_path, "wb") as f:
                 f.write(p_bytes)
-            reference_paths.append(p_path)
+            reference_paths.append(primary_path)
 
-    if brand_context.get("brand_logo_url"):
-        l_bytes = dam_client.download_image_bytes(brand_context["brand_logo_url"])
+    # B) Linked Layers & Sibling Components
+    for idx, l_url in enumerate(brand_context.get("layer_urls", [])):
+        l_bytes = dam_client.download_image_bytes(l_url)
         if l_bytes:
-            l_path = os.path.abspath(f"./reference_cache/ref_logo_{brand_context.get('brand_id', 1)}.png")
+            l_path = os.path.abspath(f"./reference_cache/ref_layer_{brand_context.get('product_id', 1)}_{idx}.png")
             with open(l_path, "wb") as f:
                 f.write(l_bytes)
+            layer_paths.append(l_path)
             reference_paths.append(l_path)
 
-    # Step 3: Extract Color & Style Intelligence
-    style_info = extract_style_and_colors(req.prompt)
+    # C) Official Logo
+    if brand_context.get("brand_logo_url"):
+        lo_bytes = dam_client.download_image_bytes(brand_context["brand_logo_url"])
+        if lo_bytes:
+            logo_path = os.path.abspath(f"./reference_cache/ref_logo_{brand_context.get('brand_id', 1)}.png")
+            with open(logo_path, "wb") as f:
+                f.write(lo_bytes)
+            reference_paths.append(logo_path)
 
-    # Step 4: Build Physically-Grounded Master Prompt (Prevents Fake Jars & Gibberish Labels)
-    pos_prompt, neg_prompt = build_organic_master_prompt(
-        user_prompt=req.prompt,
+    # Step 3: Build Dynamic DAM Asset Context (Zero Hardcoding)
+    asset_ctx = DAMAssetContext(
+        asset_id=brand_context.get("product_id") or 0,
+        title=product_name or "Product Asset",
+        description=brand_context.get("description", ""),
+        alt_text=brand_context.get("alt_text", ""),
+        tags=brand_context.get("tags", []),
         brand_name=brand_name,
-        product_name=product_name,
         brand_tagline=tagline,
-        detected_colors=style_info["detected_colors"],
-        ambience=style_info["ambience"]
+        primary_image_path=primary_path,
+        layer_image_paths=layer_paths,
+        logo_path=logo_path
     )
 
-    # Step 5: Execute Organic AI Generation (100% Native Diffusion - Zero 2D Pasting)
-    logger.info("Step 5: Synthesizing commercial image via OpenSourceDiffusionEngine...")
+    # Step 4: Dynamically Synthesize Creative Scene Prompts via UniversalLayerMixer
+    pos_prompt, neg_prompt = UniversalLayerMixer.compose_dynamic_prompts(
+        asset_context=asset_ctx,
+        user_prompt=req.prompt
+    )
+
+    # Step 5: Execute Multi-Modal Scene Synthesis (GPU Diffusion - Zero 2D Cutouts)
+    logger.info("Step 5: Synthesizing realistic scene with %d reference layer(s)...", len(reference_paths))
     final_image = diffusion_engine.generate(
         positive_prompt=pos_prompt,
         negative_prompt=neg_prompt,
@@ -562,15 +585,15 @@ CHAT_HTML = """
     <div class="message">
       <div class="avatar avatar-ai">AI</div>
       <div class="msg-content">
-        <p>👋 Welcome to your <strong>Sitecore Content Hub GenAI Brand Assistant</strong>.</p>
-        <p>Simply provide your creative prompt. The engine automatically:</p>
+        <p>👋 Welcome to your <strong>Universal Sitecore Content Hub GenAI Campaign Studio</strong>.</p>
+        <p>Simply provide any natural language creative scenario for <strong>any brand, product, or industry</strong> in your DAM. The engine automatically:</p>
         <ol style="margin-left: 20px; margin-top: 6px; margin-bottom: 6px;">
-          <li>Retrieves authentic product packshots and official logos from Sitecore DAM.</li>
-          <li>Passes them as <strong>multimodal visual reference inputs</strong> into the model.</li>
-          <li>Adapts organically to any colors, lighting, and textures specified in your prompt.</li>
-          <li>Ingests the final campaign visual directly into your <strong>Sitecore DAM Create Tab</strong>.</li>
+          <li>Retrieves the authentic asset, its brand guidelines, and <strong>all linked layers / sub-assets</strong> directly from Sitecore DAM.</li>
+          <li>Understands your creative scenario (tabletop placement, celebrity/model holding the product, or dynamic action).</li>
+          <li>Synthesizes a realistic, high-fashion 3D image with native lighting, shadows, and natural interaction.</li>
+          <li>Ingests the final campaign visual straight into your <strong>Sitecore DAM Create Tab</strong>.</li>
         </ol>
-        <p>Try one of the suggestions below or enter any custom prompt!</p>
+        <p>Try one of the scenario suggestions below or enter any prompt!</p>
       </div>
     </div>
   </div>
@@ -578,10 +601,10 @@ CHAT_HTML = """
   <div id="input-container">
     <div class="input-box-wrapper">
       <div class="quick-prompts">
-        <button class="quick-btn" onclick="setPrompt('Create a warm morning breakfast scene with Britannia Good Day butter cookies and a steaming cup of tea on a rustic wooden table in warm golden sunlight')">☕ Good Day (Warm Golden Light)</button>
-        <button class="quick-btn" onclick="setPrompt('Create a vibrant social media ad for Britannia Jim Jam biscuits with fresh strawberries and ruby red berry accents')">🍓 Jim Jam (Ruby Red Accents)</button>
-        <button class="quick-btn" onclick="setPrompt('Create an organic botanical wellness campaign for Himalaya healthcare with lush emerald green herbal leaves')">🌿 Himalaya (Emerald Green)</button>
-        <button class="quick-btn" onclick="setPrompt('Create an evening tea-time indulgence campaign for Britannia Bourbon biscuits with deep chocolate brown tones and cocoa powder')">🍫 Bourbon (Chocolate Brown)</button>
+        <button class="quick-btn" onclick="setPrompt('Place this Jim Jam biscuit on a sunlit wooden table beside a steaming porcelain coffee cup with gentle morning light')">☕ Tabletop with Coffee Cup</button>
+        <button class="quick-btn" onclick="setPrompt('A charismatic celebrity smiling and holding this Jim Jam biscuit packet in hand for a premium commercial advertisement')">🌟 Celebrity Holding Packet</button>
+        <button class="quick-btn" onclick="setPrompt('A warm breakfast scene with Britannia Good Day butter cookies beside fresh butter and tea on a rustic wooden table')">🍪 Good Day Breakfast Scene</button>
+        <button class="quick-btn" onclick="setPrompt('Create an organic botanical wellness campaign for Himalaya with lush emerald green herbal leaves and clear water droplets')">🌿 Skincare / Wellness Splash</button>
       </div>
       <form class="input-form" onsubmit="sendMessage(event)">
         <textarea id="prompt-input" placeholder="Type your creative campaign prompt here (e.g. Good Day biscuits in warm golden sunlight)..." required onkeydown="if(event.key==='Enter' && !event.shiftKey){ event.preventDefault(); sendMessage(event); }"></textarea>

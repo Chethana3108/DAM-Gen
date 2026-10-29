@@ -17,105 +17,24 @@ import logging
 from typing import List, Optional, Tuple, Dict, Any
 from PIL import Image
 
+from app.layer_mixer import UniversalLayerMixer, DAMAssetContext
+
 logger = logging.getLogger("brand-engine")
 
 # Global pipeline cache so models are loaded once into GPU VRAM
 _LOADED_PIPELINE = None
 _LOADED_MODEL_TYPE = None
 
-def get_product_grounding_details(brand_name: Optional[str], product_name: Optional[str]) -> Dict[str, str]:
-    """
-    Supplies hyper-accurate physical grounding details for DAM brand assets to prevent
-    the AI from hallucinating incorrect object types (e.g. generating a jam jar instead of sandwich biscuits).
-    """
-    p_lower = (product_name or "").lower()
-    b_lower = (brand_name or "").lower()
-
-    if "jim jam" in p_lower or "jimjam" in p_lower:
-        return {
-            "hero_description": (
-                "The hero product is Britannia Treat Jim Jam sandwich biscuits (NOT a jar, NOT a bottle, NOT jam spread container). "
-                "Feature the official Britannia Treat Jim Jam packaging with royal purple wrapper and crisp, authentic white 'Jim Jam' typography and red 'Britannia' emblem. "
-                "Beside the packaging, display the actual sandwich biscuits: two round golden-baked biscuits with delicate flower-petal scalloped edges, "
-                "sandwiching sweet vanilla cream with a glossy, translucent ruby-red strawberry jam center droplet sprinkled with fine sugar crystals."
-            ),
-            "negative_additions": "jar, bottle, jam jar, peanut butter, spread container, glass container, tin can, generic labels, fake typography, gibberish script, 2d sticker, pasted cutout",
-            "props": "fresh plump strawberries with green calyx and water droplets, splash of fresh milk, natural wooden rustic studio surface, soft morning daylight"
-        }
-    elif "good day" in p_lower or "goodday" in p_lower:
-        return {
-            "hero_description": (
-                "The hero product is Britannia Good Day Butter Cookies (NOT chocolate chip, NOT a jar). "
-                "Feature the official warm golden-yellow packaging with the classic 'Good Day' smile typography and red 'BRITANNIA' emblem. "
-                "Beside the packaging, show the actual golden round butter cookies with distinctive curved smile ridged lines."
-            ),
-            "negative_additions": "chocolate chips, dark cookies, jar, bottle, fake typography, gibberish script, 2d sticker, pasted cutout",
-            "props": "golden butter cubes, fresh wheat stalks, steaming porcelain teacup, warm sunbeam lighting"
-        }
-    elif "himalaya" in b_lower or "neem" in p_lower:
-        return {
-            "hero_description": (
-                "The hero product is Himalaya Purifying Neem Face Wash in its official green and white squeeze tube with authentic dark green 'Himalaya' branding."
-            ),
-            "negative_additions": "food, biscuit, cookie, jar, fake typography, gibberish script, 2d sticker",
-            "props": "fresh green neem leaves, clear splash of pure water droplets, natural minimalist stone pedestal, spa ambience"
-        }
-    else:
-        # Generic grounding for any DAM asset
-        clean_brand = brand_name or "Premium Brand"
-        clean_product = product_name or "Official Product"
-        return {
-            "hero_description": (
-                f"The hero product is {clean_brand} {clean_product}. "
-                f"Faithfully depict the authentic packaging featuring the exact brand name '{clean_brand}' and product name '{clean_product}' "
-                "in sharp, professional, commercial typography. Render the physical product organically in the environment with true 3D form, contact shadows, and realistic materials."
-            ),
-            "negative_additions": "fake typography, gibberish words, pseudo-letters, misplaced labels, jar, bottle, 2d sticker, pasted cutout, duplicate logo",
-            "props": "clean studio tabletop, elegant natural lighting, cinematic depth of field"
-        }
-
 def build_organic_master_prompt(
-    user_prompt: str,
-    brand_name: Optional[str],
-    product_name: Optional[str],
-    brand_tagline: Optional[str],
-    detected_colors: List[str],
-    ambience: str
+    asset_context: DAMAssetContext,
+    user_prompt: str
 ) -> Tuple[str, str]:
     """
-    Constructs a photorealistic prompt for diffusion models that organically places the authentic
-    product into the commercial scene with zero hallucinated text.
-    Returns (positive_prompt, negative_prompt).
+    Dynamically generates positive and negative commercial advertising prompts
+    by fusing DAM asset metadata, linked layers, and the user's creative prompt.
+    100% Dynamic - Zero Hardcoding.
     """
-    grounding = get_product_grounding_details(brand_name, product_name)
-    
-    pos_parts = [
-        f"Masterpiece commercial advertising photography: {user_prompt.strip().rstrip('.')}.",
-        grounding["hero_description"],
-    ]
-
-    if detected_colors:
-        color_str = ", ".join(detected_colors)
-        pos_parts.append(f"Visual palette styled with deliberate brand color accents of {color_str}.")
-
-    pos_parts.append(f"Scene setting: {grounding['props']}. Lighting: {ambience}.")
-
-    if brand_tagline:
-        pos_parts.append(f"Campaign theme: '{brand_tagline}'.")
-
-    pos_parts.append(
-        "Ultra-photorealistic, 8k resolution, Hasselblad medium format photography, "
-        "subsurface scattering, realistic specular reflections, cinematic commercial color grading."
-    )
-
-    neg_parts = [
-        "deformed, distorted, ugly, blurry, low quality, noise, grain",
-        "gibberish, fake text, garbled letters, misspelled words, pseudo-alphabet",
-        "duplicate logos, floating text, sticker overlay, 2d collage, pasted layers",
-        grounding["negative_additions"]
-    ]
-
-    return " ".join(pos_parts), ", ".join(neg_parts)
+    return UniversalLayerMixer.compose_dynamic_prompts(asset_context, user_prompt)
 
 class OpenSourceDiffusionEngine:
     """
@@ -229,23 +148,11 @@ class OpenSourceDiffusionEngine:
                 _LOADED_MODEL_TYPE = "ip-adapter"
                 logger.info("SDXL + IP-Adapter successfully loaded!")
 
-            # Load primary reference image from DAM
-            ref_img = None
-            if reference_image_paths and os.path.exists(reference_image_paths[0]):
-                ref_img = Image.open(reference_image_paths[0]).convert("RGB")
-                logger.info(f"Injecting DAM reference image {reference_image_paths[0]} into IP-Adapter...")
-
-            kwargs = {
-                "prompt": positive_prompt,
-                "negative_prompt": negative_prompt,
-                "width": width,
-                "height": height,
-                "num_inference_steps": 30,
-                "guidance_scale": 7.5,
-                "generator": generator
-            }
-            if ref_img is not None:
-                kwargs["ip_adapter_image"] = ref_img
+            # Load all available DAM reference layers (packshot, sub-assets, cutouts)
+            valid_ref_imgs = [Image.open(p).convert("RGB") for p in reference_image_paths if os.path.exists(p)]
+            if valid_ref_imgs:
+                logger.info(f"Injecting {len(valid_ref_imgs)} DAM reference layer(s) into IP-Adapter...")
+                kwargs["ip_adapter_image"] = valid_ref_imgs if len(valid_ref_imgs) > 1 else valid_ref_imgs[0]
 
             return _LOADED_PIPELINE(**kwargs).images[0]
 
@@ -304,3 +211,4 @@ class OpenSourceDiffusionEngine:
         # Final safety fallback: synthetic clean placeholder if all internet endpoints are unreachable
         logger.warning("Network endpoints offline. Returning clean studio visual placeholder.")
         return Image.new("RGB", (width, height), color=(245, 240, 235))
+

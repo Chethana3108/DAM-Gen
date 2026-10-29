@@ -19,3 +19,4 @@ python3 -c "import torch; print('CUDA Available:', torch.cuda.is_available(), '|
 # 3. Launch FastAPI server with GPU acceleration
 echo "🔥 Launching server on port 8000..."
 python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+
