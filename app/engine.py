@@ -1,355 +1,124 @@
 """
-Advanced Open-Source Diffusion Engine for GPU Servers (Vast.ai) and Multi-modal Generation.
-Supports:
-1. FLUX.1-schnell (Black Forest Labs 12B Flow Transformer) - State-of-the-art text rendering,
-   exact brand typography, and photo-realism (Apache 2.0 open-weights).
-2. SDXL with IP-Adapter (h94/IP-Adapter) - Multimodal reference-grounded diffusion that injects
-   the Sitecore DAM product packshot directly into cross-attention layers.
-3. High-Fidelity Remote / API Fallback for development environments.
-
-Zero 2D compositing / zero sticker pasting - 100% organically synthesized by the AI.
+Clean, Production-Grade GPT Image Engine.
+Powered by OpenAI GPT Image model (e.g. gpt-image-2.5-sunburst)
+for reference-guided commercial advertising visual generation, editing, and variations.
 """
 
 import os
-import io
-import time
 import logging
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Union
 from PIL import Image
 
-from app.layer_mixer import UniversalLayerMixer, DAMAssetContext
+from app.gpt_image_service import GPTImageService
 
-logger = logging.getLogger("brand-engine")
+logger = logging.getLogger("gpt-engine")
 
-# Global pipeline cache so models are loaded once into GPU VRAM
-_LOADED_PIPELINE = None
-_LOADED_MODEL_TYPE = None
-
-def build_organic_master_prompt(
-    asset_context: DAMAssetContext,
-    user_prompt: str
-) -> Tuple[str, str]:
+class GPTImageEngine:
     """
-    Dynamically generates positive and negative commercial advertising prompts
-    by fusing DAM asset metadata, linked layers, and the user's creative prompt.
-    100% Dynamic - Zero Hardcoding.
-    """
-    return UniversalLayerMixer.compose_dynamic_prompts(asset_context, user_prompt)
-
-class OpenSourceDiffusionEngine:
-    """
-    Engine that manages local GPU inference (FLUX.1 / SDXL IP-Adapter) and remote endpoints.
+    Core image generation engine wrapping GPT Image service.
+    Directly routes reference assets to the image model's editing/reference endpoints.
     """
     def __init__(self):
-        self.model_type = os.getenv("DIFFUSION_MODEL_TYPE", "flux").lower()
-        self.has_cuda = False
-        try:
-            import torch
-            self.has_cuda = torch.cuda.is_available()
-        except ImportError:
-            self.has_cuda = False
+        self.model = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2.5-sunburst")
+        self.gpt_service = GPTImageService(model=self.model)
+        logger.info("Initialized GPTImageEngine with model '%s'", self.model)
 
-        logger.info(f"Initialized OpenSourceDiffusionEngine (CUDA={self.has_cuda}, preferred={self.model_type})")
+    @property
+    def is_available(self) -> bool:
+        return self.gpt_service.is_available
 
     def generate(
         self,
         positive_prompt: str,
-        negative_prompt: str,
-        reference_image_paths: List[str],
+        negative_prompt: str = "",
+        reference_image_paths: Optional[List[str]] = None,
         width: int = 1024,
         height: int = 1024,
-        seed: Optional[int] = None
+        seed: Optional[int] = None,
+        mask_path: Optional[str] = None
     ) -> Image.Image:
         """
-        Generates the commercial visual organically using the best available model.
-        Priority:
-        1. Official Black Forest Labs API (FLUX.2 Max / Pro) if BFL_API_KEY is configured.
-        2. Local GPU Server Pipeline (FLUX.2-dev / schnell in CUDA bfloat16 on Vast.ai).
-        3. Multi-Reference Remote Endpoint (FLUX.2-dev on Hugging Face).
+        Generates commercial visual scenes. If reference image paths are supplied,
+        they are GENUINELY forwarded to the reference-guided generation / editing API.
         """
-        # Option 1: Official Black Forest Labs API (FLUX.2 Max)
-        bfl_res = self._generate_via_bfl_api(
-            positive_prompt=positive_prompt,
-            reference_image_paths=reference_image_paths,
+        size_str = f"{width}x{height}"
+
+        if reference_image_paths and len(reference_image_paths) > 0:
+            primary_ref = reference_image_paths[0]
+            additional_refs = reference_image_paths[1:] if len(reference_image_paths) > 1 else None
+            logger.info("Generating image using authentic reference asset: %s", primary_ref)
+            return self.gpt_service.generate_with_reference(
+                prompt=positive_prompt,
+                reference_image=primary_ref,
+                additional_references=additional_refs,
+                mask=mask_path,
+                size=size_str
+            )
+        else:
+            logger.info("Generating image using text-to-image prompt: %s...", positive_prompt[:80])
+            return self.gpt_service.generate(prompt=positive_prompt, size=size_str)
+
+    def edit(
+        self,
+        image: Union[Image.Image, str, bytes],
+        prompt: str,
+        mask: Optional[Union[Image.Image, str, bytes]] = None,
+        width: int = 1024,
+        height: int = 1024
+    ) -> Image.Image:
+        """
+        Applies a targeted edit or refinement to an existing image.
+        """
+        size_str = f"{width}x{height}"
+        return self.gpt_service.edit(
+            image=image,
+            prompt=prompt,
+            size=size_str,
+            mask=mask
+        )
+
+    def refine(
+        self,
+        image: Union[Image.Image, str, bytes],
+        refinement_instruction: str,
+        original_prompt: str,
+        width: int = 1024,
+        height: int = 1024
+    ) -> Image.Image:
+        """
+        Refines a generated visual to correct specific QA defects.
+        """
+        targeted_prompt = (
+            f"Modify this commercial image to fix the following issues: {refinement_instruction}. "
+            f"Original requirement: {original_prompt}. "
+            "Maintain professional advertising composition, photorealistic textures, and seamless integration."
+        )
+        return self.edit(
+            image=image,
+            prompt=targeted_prompt,
             width=width,
             height=height
         )
-        if bfl_res is not None:
-            return bfl_res
 
-        # Option 2: GPU Server Pipeline (Vast.ai)
-        if self.has_cuda:
-            try:
-                return self._generate_on_gpu(
-                    positive_prompt=positive_prompt,
-                    negative_prompt=negative_prompt,
-                    reference_image_paths=reference_image_paths,
-                    width=width,
-                    height=height,
-                    seed=seed
-                )
-            except Exception as e:
-                logger.error(f"Local GPU generation error: {e}. Falling back to remote endpoint...")
-
-        # Option 3: Remote / API Pipeline (HF Spaces / FLUX endpoints)
-        return self._generate_remote(
-            positive_prompt=positive_prompt,
-            negative_prompt=negative_prompt,
-            reference_image_paths=reference_image_paths,
-            width=width,
-            height=height
+    def generate_variation(
+        self,
+        prompt: str,
+        reference_image_path: Optional[str] = None,
+        previous_image: Optional[Image.Image] = None,
+        width: int = 1024,
+        height: int = 1024,
+        variation_index: int = 1
+    ) -> Image.Image:
+        """
+        Generates aesthetic variations using the reference asset or previous composition.
+        """
+        return self.gpt_service.generate_variation(
+            prompt=prompt,
+            reference_image=reference_image_path,
+            previous_image=previous_image,
+            size=f"{width}x{height}",
+            variation_index=variation_index
         )
 
-    def _generate_via_bfl_api(
-        self,
-        positive_prompt: str,
-        reference_image_paths: List[str],
-        width: int,
-        height: int
-    ) -> Optional[Image.Image]:
-        """
-        Invokes the official Black Forest Labs FLUX.2 Max / Pro API (https://api.bfl.ai/v1/flux-2-max).
-        Uses asynchronous submission and polling pattern.
-        """
-        import requests
-        import base64
-
-        bfl_key = os.getenv("BFL_API_KEY")
-        if not bfl_key:
-            return None
-
-        bfl_model = os.getenv("BFL_MODEL", "flux-2-max")
-        url = f"https://api.bfl.ai/v1/{bfl_model}"
-        headers = {
-            "accept": "application/json",
-            "x-key": bfl_key,
-            "Content-Type": "application/json"
-        }
-
-        payload: Dict[str, Any] = {
-            "prompt": positive_prompt,
-            "width": width,
-            "height": height,
-            "output_format": "jpeg"
-        }
-
-        # Multi-reference input support for BFL API
-        if reference_image_paths and os.path.exists(reference_image_paths[0]):
-            with open(reference_image_paths[0], "rb") as f:
-                b64_ref = base64.b64encode(f.read()).decode("utf-8")
-            payload["input_image"] = f"data:image/png;base64,{b64_ref}"
-
-        logger.info(f"Submitting task to Black Forest Labs API ({url})...")
-        try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=30)
-            resp.raise_for_status()
-            sub_data = resp.json()
-            polling_url = sub_data.get("polling_url")
-            task_id = sub_data.get("id")
-            logger.info(f"BFL Task submitted successfully. Task ID: {task_id}")
-
-            # Asynchronous Polling loop
-            if polling_url:
-                start_time = time.time()
-                while time.time() - start_time < 120:
-                    poll_resp = requests.get(polling_url, headers={"x-key": bfl_key}, timeout=15)
-                    if poll_resp.status_code == 200:
-                        poll_data = poll_resp.json()
-                        status = poll_data.get("status")
-                        if status == "Ready":
-                            img_url = poll_data.get("result", {}).get("sample")
-                            if img_url:
-                                img_bytes = requests.get(img_url, timeout=30).content
-                                logger.info(f"Successfully generated visual via BFL API ({bfl_model})!")
-                                return Image.open(io.BytesIO(img_bytes))
-                        elif status in ["Error", "Failed"]:
-                            logger.error(f"BFL API generation failed: {poll_data}")
-                            break
-                    time.sleep(2)
-        except Exception as e:
-            logger.warning(f"BFL API invocation error: {e}. Falling back to standard pipeline...")
-
-        return None
-
-    def _generate_on_gpu(
-        self,
-        positive_prompt: str,
-        negative_prompt: str,
-        reference_image_paths: List[str],
-        width: int,
-        height: int,
-        seed: Optional[int] = None
-    ) -> Image.Image:
-        """Runs native PyTorch Diffusers pipeline on Vast.ai NVIDIA GPU."""
-        import torch
-        global _LOADED_PIPELINE, _LOADED_MODEL_TYPE
-
-        generator = torch.Generator("cuda")
-        if seed is not None:
-            generator.manual_seed(seed)
-        else:
-            generator.seed()
-
-        # Target: FLUX.2 / FLUX.1 (World's #1 model for text, brand fidelity, and commercial realism)
-        if "flux" in self.model_type:
-            if _LOADED_PIPELINE is None or _LOADED_MODEL_TYPE != self.model_type:
-                logger.info(f"Loading FLUX.2 pipeline ({self.model_type}) into GPU VRAM (bfloat16)...")
-                try:
-                    from diffusers import Flux2Pipeline
-                    _LOADED_PIPELINE = Flux2Pipeline.from_pretrained(
-                        "black-forest-labs/FLUX.2-dev",
-                        torch_dtype=torch.bfloat16
-                    ).to("cuda")
-                    logger.info("FLUX.2-dev successfully loaded into GPU VRAM!")
-                except Exception as e_flux2:
-                    logger.info(f"Flux2Pipeline load exception ({e_flux2}); using FluxPipeline...")
-                    from diffusers import FluxPipeline
-                    model_repo = "black-forest-labs/FLUX.2-dev" if "2" in self.model_type else "black-forest-labs/FLUX.1-schnell"
-                    _LOADED_PIPELINE = FluxPipeline.from_pretrained(
-                        model_repo,
-                        torch_dtype=torch.bfloat16
-                    ).to("cuda")
-                    logger.info(f"{model_repo} successfully loaded!")
-                _LOADED_MODEL_TYPE = self.model_type
-
-            logger.info("Synthesizing visual with FLUX.2 (Rectified Flow Transformer)...")
-            pipe_kwargs = {
-                "prompt": positive_prompt,
-                "width": width,
-                "height": height,
-                "num_inference_steps": 24 if "dev" in self.model_type or "2" in self.model_type else 4,
-                "generator": generator
-            }
-            # Multi-reference input support if available
-            valid_refs = [Image.open(p).convert("RGB") for p in reference_image_paths if os.path.exists(p)]
-            if valid_refs and hasattr(_LOADED_PIPELINE, "image"):
-                pipe_kwargs["image"] = valid_refs[0]
-
-            result = _LOADED_PIPELINE(**pipe_kwargs).images[0]
-            return result
-
-        # Target: SDXL with IP-Adapter (Direct reference image conditioning)
-        elif self.model_type == "ip-adapter":
-            if _LOADED_PIPELINE is None or _LOADED_MODEL_TYPE != "ip-adapter":
-                from diffusers import AutoPipelineForText2Image
-                logger.info("Loading SDXL + IP-Adapter pipeline into GPU VRAM...")
-                pipe = AutoPipelineForText2Image.from_pretrained(
-                    "stabilityai/stable-diffusion-xl-base-1.0",
-                    torch_dtype=torch.float16,
-                    variant="fp16"
-                ).to("cuda")
-                pipe.load_ip_adapter(
-                    "h94/IP-Adapter",
-                    subfolder="sdxl_models",
-                    weight_name="ip-adapter-plus_sdxl_vit-h.bin"
-                )
-                pipe.set_ip_adapter_scale(0.7)
-                _LOADED_PIPELINE = pipe
-                _LOADED_MODEL_TYPE = "ip-adapter"
-                logger.info("SDXL + IP-Adapter successfully loaded!")
-
-            # Load all available DAM reference layers (packshot, sub-assets, cutouts)
-            valid_ref_imgs = [Image.open(p).convert("RGB") for p in reference_image_paths if os.path.exists(p)]
-            if valid_ref_imgs:
-                logger.info(f"Injecting {len(valid_ref_imgs)} DAM reference layer(s) into IP-Adapter...")
-                kwargs["ip_adapter_image"] = valid_ref_imgs if len(valid_ref_imgs) > 1 else valid_ref_imgs[0]
-
-            return _LOADED_PIPELINE(**kwargs).images[0]
-
-        else:
-            raise ValueError(f"Unknown GPU model type: {self.model_type}")
-
-    def _generate_remote(
-        self,
-        positive_prompt: str,
-        negative_prompt: str,
-        reference_image_paths: List[str],
-        width: int,
-        height: int
-    ) -> Image.Image:
-        """
-        Remote / API generation for development environments.
-        Uses pure open-source diffusion without any 2D pasting.
-        """
-        from gradio_client import Client as GradioClient, handle_file
-        
-        endpoint = os.getenv("MODEL_ENDPOINT", "black-forest-labs/FLUX.2-dev")
-        hf_token = os.getenv("HF_TOKEN", None) or None
-        logger.info(f"Using remote diffusion endpoint: {endpoint}")
-
-        # Attempt 1: FLUX.2 / FLUX.1 endpoint
-        endpoints_to_try = [
-            endpoint,
-            "black-forest-labs/FLUX.2-dev",
-            "multimodalart/FLUX.2-dev-turbo",
-            "black-forest-labs/FLUX.1-schnell"
-        ]
-        # Remove duplicates while preserving order
-        seen = set()
-        endpoints_to_try = [x for x in endpoints_to_try if not (x in seen or seen.add(x))]
-
-        for ep in endpoints_to_try:
-            try:
-                logger.info(f"Connecting to diffusion space: {ep}...")
-                client = GradioClient(ep, token=hf_token)
-                
-                # Check for FLUX.2-dev multi-reference signature
-                res_path = None
-                try:
-                    # Input images gallery for multi-reference conditioning
-                    img_list = []
-                    for p in reference_image_paths:
-                        if os.path.exists(p):
-                            img_list.append({"image": handle_file(p), "caption": "DAM Product Reference"})
-
-                    res_path = client.predict(
-                        prompt=positive_prompt,
-                        input_images=img_list,
-                        seed=0,
-                        randomize_seed=True,
-                        width=width,
-                        height=height,
-                        num_inference_steps=24,
-                        guidance_scale=4.0,
-                        prompt_upsampling=False,
-                        api_name="/infer"
-                    )
-                except Exception as e_flux2_sig:
-                    # Standard FLUX.1 schnell / turbo signature
-                    res_path = client.predict(
-                        prompt=positive_prompt,
-                        seed=0,
-                        randomize_seed=True,
-                        width=width,
-                        height=height,
-                        num_inference_steps=4,
-                        api_name="/infer"
-                    )
-
-                img_file = res_path
-                if isinstance(res_path, (list, tuple)):
-                    img_file = res_path[0]
-                if isinstance(img_file, dict):
-                    img_file = img_file.get("path")
-
-                if img_file and os.path.exists(img_file):
-                    logger.info(f"Successfully synthesized visual via {ep}!")
-                    return Image.open(img_file)
-
-            except Exception as e:
-                logger.warning(f"Endpoint {ep} failed: {e}. Trying next available model...")
-
-        # Attempt 2: High-speed SDXL endpoint with zero pasting
-        try:
-            sdxl_client = GradioClient("AP123/SDXL-Lightning")
-            img_path = sdxl_client.predict(positive_prompt, "4-Step", api_name="/generate_image")
-            if os.path.exists(img_path):
-                logger.info("Successfully generated via high-speed SDXL (clean organic render)!")
-                return Image.open(img_path)
-        except Exception as e:
-            logger.error(f"High-speed fallback failed: {e}")
-
-        # Final safety fallback: synthetic clean placeholder if all internet endpoints are unreachable
-        logger.warning("Network endpoints offline. Returning clean studio visual placeholder.")
-        return Image.new("RGB", (width, height), color=(245, 240, 235))
-
+# Backward-compatible alias
+OpenSourceDiffusionEngine = GPTImageEngine

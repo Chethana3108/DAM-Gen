@@ -1,11 +1,34 @@
+# Environment variables and secrets
 .env
+.env.*
+!.env.example
+
+# Virtual environments
 .venv/
 venv/
+ENV/
+
+# Python cache & bytecode
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Local data, logs & temporary reference caches
 reference_cache/
 generation_logs/
+test_outputs/
+*.log
+
+# Generated test images
 *.png
 *.jpg
 *.jpeg
+*.webp
+
+# OS & IDE metadata
 .DS_Store
+Thumbs.db
+.vscode/
+.idea/
