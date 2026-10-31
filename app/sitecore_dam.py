@@ -94,7 +94,9 @@ class SitecoreDAMClient:
         Filters out non-image files and system bundles.
         """
         headers = self._auth_headers()
-        url = f"{self.ch_url}/api/entities/query?query=Definition.Name=='M.Asset'&take={take * 2}"
+        # Sitecore Content Hub allows a maximum take of 100
+        query_take = min(max(take * 2, 50), 100)
+        url = f"{self.ch_url}/api/entities/query?query=Definition.Name=='M.Asset'&take={query_take}"
 
         assets = []
         try:
@@ -119,7 +121,20 @@ class SitecoreDAMClient:
                     h = file_props.get("height")
                     dim_str = f"{w}x{h}" if (w and h) else ""
 
-                    thumb_url = self._get_asset_delivery_url(aid, preferred=["preview", "bigthumbnail", "thumbnail", "downloadPreview"])
+                    # Fast rendition extraction directly from query payload
+                    thumb_url = None
+                    rend_dict = item.get("renditions", {})
+                    for pref in ["preview", "bigthumbnail", "thumbnail", "downloadPreview", "downloadOriginal"]:
+                        pref_list = rend_dict.get(pref)
+                        if pref_list and isinstance(pref_list, list) and len(pref_list) > 0:
+                            candidate_url = pref_list[0].get("href")
+                            if candidate_url and "no-image" not in candidate_url:
+                                thumb_url = candidate_url
+                                break
+
+                    # Fallback to rendition endpoint if not in item payload
+                    if not thumb_url:
+                        thumb_url = self._get_asset_delivery_url(aid, preferred=["preview", "bigthumbnail", "thumbnail", "downloadPreview"])
 
                     assets.append({
                         "id": aid,
